@@ -262,6 +262,17 @@ class Dashboard:
             "Bracket probability:",
             f"{best_prob:.1%}" if best_prob is not None else "N/A",
         )
+
+        tomorrow_prediction = "N/A"
+        if analysis.tomorrow_date and analysis.tomorrow_forecast_mean is not None:
+            tomorrow_prediction = f"{analysis.tomorrow_date}: {analysis.tomorrow_forecast_mean:.1f}°F"
+        elif analysis.tomorrow_date:
+            tomorrow_prediction = f"{analysis.tomorrow_date}: N/A"
+        grid.add_row(
+            "[magenta]Tomorrow prediction:[/magenta]",
+            f"[magenta]{tomorrow_prediction}[/magenta]",
+        )
+
         body = Group(
             grid,
             Text(f"\nModel read: {model_read}", style="dim"),

@@ -19,6 +19,7 @@ from kalshi_weather.data.weather import CombinedWeatherSource
 from kalshi_weather.data.stations import NWSStationParser
 # from kalshi_weather.data.markets import KalshiMarketSource # Assuming this exists or using Contract class
 from kalshi_weather.engine.edge_detector import EdgeDetector
+from kalshi_weather.engine.calibration import ForecastCalibrator
 from kalshi_weather.cli.display import Dashboard
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ class WeatherBot:
         
         from kalshi_weather.config import get_city
         self.city_config = get_city(city_code)
+        self.calibrator = ForecastCalibrator(city=self.city_config)
 
         # Initialize Data Sources
         self.weather_source = CombinedWeatherSource(city=self.city_config)
@@ -67,21 +69,26 @@ class WeatherBot:
         today = datetime.now().strftime("%Y-%m-%d")
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
-        # Prefer tomorrow for advisory planning, but keep dashboard connected to
-        # a live market by falling back to today if tomorrow brackets are absent.
-        target_date = tomorrow
+        # Prefer today's market. If absent, fall back to tomorrow.
+        target_date = today
         brackets = self.contract.fetch_brackets(target_date)
         if not brackets:
             logger.warning(
                 "No market brackets found for %s; falling back to %s",
                 target_date,
-                today,
+                tomorrow,
             )
-            target_date = today
+            target_date = tomorrow
             brackets = self.contract.fetch_brackets(target_date)
 
         # 1. Fetch Forecasts
         forecasts = self.contract.fetch_forecasts(target_date)
+        # Update rolling forecast-error calibration store (best effort).
+        try:
+            self.calibrator.record_forecast_snapshot(forecasts, target_date=target_date)
+            self.calibrator.refresh_settlement_errors()
+        except Exception as exc:
+            logger.warning("Forecast calibration update skipped: %s", exc)
         
         # 2. Fetch Observations
         # The station source needs to implement `get_daily_summary`
@@ -113,6 +120,8 @@ class WeatherBot:
 
         combined = combine_forecasts(forecasts)
         adjusted = adjust_forecast_with_observations(combined, observation)
+        tomorrow_forecasts = self.contract.fetch_forecasts(tomorrow)
+        tomorrow_combined = combine_forecasts(tomorrow_forecasts) if tomorrow_forecasts else None
         bracket_probs = BracketProbabilityCalculator().calculate_all_probabilities(
             brackets,
             adjusted.mean_temp_f,
@@ -136,6 +145,8 @@ class WeatherBot:
             raw_forecast_std=combined.std_dev if combined else None,
             adjusted_forecast_mean=adjusted.mean_temp_f,
             adjusted_forecast_std=adjusted.std_dev,
+            tomorrow_date=tomorrow,
+            tomorrow_forecast_mean=tomorrow_combined.mean_temp_f if tomorrow_combined else None,
             model_probabilities=model_probabilities,
             trajectory_assessment=adjusted.trajectory_assessment,
         )

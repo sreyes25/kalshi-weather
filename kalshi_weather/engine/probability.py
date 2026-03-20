@@ -31,6 +31,7 @@ from kalshi_weather.core import (
     TrajectoryAssessment,
 )
 from kalshi_weather.data.stations import get_recent_observation_history
+from kalshi_weather.engine.calibration import get_runtime_source_corrections
 from kalshi_weather.engine.trajectory import TrajectoryEngine
 
 logger = logging.getLogger(__name__)
@@ -123,6 +124,8 @@ class ForecastCombiner:
         weights: Optional[Dict[str, float]] = None,
         min_std_dev: float = MIN_STD_DEV,
         max_std_dev: float = MAX_STD_DEV,
+        source_corrections: Optional[Dict[str, Dict[str, float]]] = None,
+        use_auto_corrections: bool = True,
     ):
         """
         Initialize the forecast combiner.
@@ -136,6 +139,8 @@ class ForecastCombiner:
         self.weights = weights or DEFAULT_WEIGHTS.copy()
         self.min_std_dev = min_std_dev
         self.max_std_dev = max_std_dev
+        self.source_corrections = source_corrections
+        self.use_auto_corrections = use_auto_corrections
 
     def get_weight(self, source: str) -> float:
         """
@@ -181,8 +186,34 @@ class ForecastCombiner:
             logger.warning("No valid forecasts after filtering")
             return None
 
-        # Get weights for each forecast
-        weights = [self.get_weight(f.source) for f in valid_forecasts]
+        corrections = self.source_corrections
+        if corrections is None and self.use_auto_corrections:
+            corrections = get_runtime_source_corrections()
+
+        # Get calibrated temperatures and reliability-adjusted weights.
+        corrected_temps: List[float] = []
+        calibrated_variances: List[float] = []
+        weights: List[float] = []
+        for forecast in valid_forecasts:
+            base_weight = self.get_weight(forecast.source)
+            bias, mae, sample_count = self._get_source_calibration(forecast.source, corrections or {})
+
+            # Shrink bias correction with sample count to avoid overfitting sparse history.
+            sample_conf = min(1.0, sample_count / 10.0)
+            corrected_temp = forecast.forecast_temp_f - (bias * sample_conf)
+
+            # Downweight noisier sources using rolling MAE; keep bounded influence.
+            weight_multiplier = self._clamp(2.5 / max(1.0, mae), 0.60, 1.30)
+            adjusted_weight = base_weight * weight_multiplier
+
+            # Add residual calibration uncertainty to source variance.
+            residual_var = (0.35 * mae * sample_conf) ** 2
+            calibrated_var = (forecast.std_dev ** 2) + residual_var
+
+            corrected_temps.append(corrected_temp)
+            calibrated_variances.append(calibrated_var)
+            weights.append(adjusted_weight)
+
         total_weight = sum(weights)
 
         # Normalize weights
@@ -190,21 +221,21 @@ class ForecastCombiner:
 
         # Calculate weighted mean
         weighted_mean = sum(
-            w * f.forecast_temp_f
-            for w, f in zip(normalized_weights, valid_forecasts)
+            w * temp
+            for w, temp in zip(normalized_weights, corrected_temps)
         )
 
         # Calculate combined variance using two components:
         # 1. Pooled variance (weighted average of individual variances)
         pooled_variance = sum(
-            w * (f.std_dev ** 2)
-            for w, f in zip(normalized_weights, valid_forecasts)
+            w * var
+            for w, var in zip(normalized_weights, calibrated_variances)
         )
 
         # 2. Disagreement variance (weighted variance of forecast means)
         disagreement_variance = sum(
-            w * ((f.forecast_temp_f - weighted_mean) ** 2)
-            for w, f in zip(normalized_weights, valid_forecasts)
+            w * ((temp - weighted_mean) ** 2)
+            for w, temp in zip(normalized_weights, corrected_temps)
         )
 
         # Combined variance is sum of both components
@@ -244,6 +275,31 @@ class ForecastCombiner:
             weights_used=weights_used,
             individual_forecasts=valid_forecasts,
         )
+
+    @staticmethod
+    def _clamp(value: float, lower: float, upper: float) -> float:
+        return max(lower, min(upper, value))
+
+    def _get_source_calibration(
+        self,
+        source: str,
+        corrections: Dict[str, Dict[str, float]],
+    ) -> tuple[float, float, float]:
+        payload = corrections.get(source)
+        if payload is None:
+            source_lower = source.lower()
+            for key, value in corrections.items():
+                if key.lower() in source_lower or source_lower in key.lower():
+                    payload = value
+                    break
+
+        if not payload:
+            return 0.0, 2.5, 0.0
+
+        bias = float(payload.get("bias_f", 0.0))
+        mae = max(0.5, float(payload.get("mae_f", 2.5)))
+        sample_count = max(0.0, float(payload.get("sample_count", 0.0)))
+        return bias, mae, sample_count
 
     def combine_with_custom_weights(
         self,

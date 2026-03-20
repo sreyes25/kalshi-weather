@@ -380,6 +380,49 @@ class TestCustomWeights:
         assert combiner.get_weight("NWS") == original_nws_weight
 
 
+class TestSourceCalibrationAdjustments:
+    """Tests for rolling bias/MAE source calibration in the combiner."""
+
+    def test_bias_correction_pulls_mean_toward_settlement_history(self):
+        forecasts = [
+            make_forecast("ModelA", 60.0, std_dev=2.0),
+            make_forecast("ModelB", 50.0, std_dev=2.0),
+        ]
+        baseline = ForecastCombiner(
+            weights={"ModelA": 1.0, "ModelB": 1.0, "default": 1.0},
+            use_auto_corrections=False,
+        ).combine(forecasts)
+        assert baseline is not None
+        assert abs(baseline.mean_temp_f - 55.0) < 0.01
+
+        calibrated = ForecastCombiner(
+            weights={"ModelA": 1.0, "ModelB": 1.0, "default": 1.0},
+            source_corrections={
+                "ModelA": {"bias_f": 5.0, "mae_f": 1.0, "sample_count": 12},
+            },
+            use_auto_corrections=False,
+        ).combine(forecasts)
+        assert calibrated is not None
+        assert calibrated.mean_temp_f < baseline.mean_temp_f
+        assert calibrated.mean_temp_f < 54.0
+
+    def test_sparse_samples_do_not_overcorrect(self):
+        forecasts = [
+            make_forecast("ModelA", 60.0, std_dev=2.0),
+            make_forecast("ModelB", 50.0, std_dev=2.0),
+        ]
+        sparse = ForecastCombiner(
+            weights={"ModelA": 1.0, "ModelB": 1.0, "default": 1.0},
+            source_corrections={
+                "ModelA": {"bias_f": 6.0, "mae_f": 1.5, "sample_count": 2},
+            },
+            use_auto_corrections=False,
+        ).combine(forecasts)
+        assert sparse is not None
+        # Small sample correction is shrunk by confidence (2/10), so should remain near baseline.
+        assert sparse.mean_temp_f > 53.0
+
+
 # =============================================================================
 # INTEGRATION-STYLE TESTS
 # =============================================================================

@@ -183,6 +183,8 @@ class MarketAnalysis:
     raw_forecast_std: Optional[float] = None       # Pre-observation combined std
     adjusted_forecast_mean: Optional[float] = None # Post-observation/trajectory mean
     adjusted_forecast_std: Optional[float] = None  # Post-observation/trajectory std
+    tomorrow_date: Optional[str] = None            # YYYY-MM-DD reference
+    tomorrow_forecast_mean: Optional[float] = None # Forecast-only mean for tomorrow
     model_probabilities: Dict[str, float] = field(default_factory=dict)  # ticker -> probability
     trajectory_assessment: Optional[TrajectoryAssessment] = None
 
