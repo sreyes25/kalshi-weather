@@ -157,3 +157,20 @@ def test_late_day_lock_reduces_upper_bracket_probability():
     )[0].model_prob
 
     assert high_bracket_prob < 0.12
+
+
+def test_stale_late_day_history_does_not_force_lock_mode():
+    readings = [
+        make_reading(12, 0, 74.8),
+        make_reading(12, 30, 74.2),
+        make_reading(13, 0, 73.9),
+    ]
+    observation = make_observation(observed_high=75.6, readings=readings)
+    adjusted = adjust_forecast_with_observations(
+        combined_forecast=make_combined_forecast(mean=77.0, std_dev=2.8),
+        observation=observation,
+        timezone=NYC_TZ,
+        current_time=datetime(2026, 6, 20, 18, 5, tzinfo=NYC_TZ),
+    )
+
+    assert not adjusted.lock_mode_active

@@ -176,9 +176,13 @@ class MarketAnalysis:
     observation: Optional[DailyObservation]
     brackets: List[MarketBracket]
     signals: List[TradingSignal]
-    forecast_mean: float           # Combined forecast mean
-    forecast_std: float            # Combined forecast std dev
+    forecast_mean: float           # Backward-compatible displayed model mean
+    forecast_std: float            # Backward-compatible displayed model std dev
     analyzed_at: datetime
+    raw_forecast_mean: Optional[float] = None      # Pre-observation combined mean
+    raw_forecast_std: Optional[float] = None       # Pre-observation combined std
+    adjusted_forecast_mean: Optional[float] = None # Post-observation/trajectory mean
+    adjusted_forecast_std: Optional[float] = None  # Post-observation/trajectory std
     model_probabilities: Dict[str, float] = field(default_factory=dict)  # ticker -> probability
     trajectory_assessment: Optional[TrajectoryAssessment] = None
 

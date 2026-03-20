@@ -34,13 +34,28 @@ def _safe_trend_f_per_hour(readings: Iterable[StationReading]) -> float:
     if len(series) < 2:
         return 0.0
 
-    first = series[0]
-    last = series[-1]
-    hours = (last.timestamp - first.timestamp).total_seconds() / 3600.0
-    if hours <= 0.0:
+    t0 = series[0].timestamp
+    xs = [
+        (r.timestamp - t0).total_seconds() / 3600.0
+        for r in series
+    ]
+    ys = [r.reported_temp_f for r in series]
+
+    span_hours = xs[-1] - xs[0]
+    if span_hours <= 0.0:
+        return 0.0
+    if span_hours < 0.25:
+        # Tiny windows are too noisy; avoid unstable slope estimates.
         return 0.0
 
-    return (last.reported_temp_f - first.reported_temp_f) / hours
+    x_mean = sum(xs) / len(xs)
+    y_mean = sum(ys) / len(ys)
+    denom = sum((x - x_mean) ** 2 for x in xs)
+    if denom <= 1e-9:
+        return 0.0
+
+    slope = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys)) / denom
+    return slope
 
 
 class TrajectoryEngine:

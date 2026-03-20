@@ -64,19 +64,28 @@ class WeatherBot:
 
     def perform_analysis(self) -> MarketAnalysis:
         """Run one full analysis cycle."""
-        target_date = datetime.now().strftime("%Y-%m-%d") # Today
-        # Or should it be tomorrow if market closed?
-        # For now, assume trading today's high.
-        
+        today = datetime.now().strftime("%Y-%m-%d")
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        # Prefer tomorrow for advisory planning, but keep dashboard connected to
+        # a live market by falling back to today if tomorrow brackets are absent.
+        target_date = tomorrow
+        brackets = self.contract.fetch_brackets(target_date)
+        if not brackets:
+            logger.warning(
+                "No market brackets found for %s; falling back to %s",
+                target_date,
+                today,
+            )
+            target_date = today
+            brackets = self.contract.fetch_brackets(target_date)
+
         # 1. Fetch Forecasts
         forecasts = self.contract.fetch_forecasts(target_date)
         
         # 2. Fetch Observations
         # The station source needs to implement `get_daily_summary`
         observation = self.station_source.get_daily_summary(target_date)
-        
-        # 3. Fetch Market Brackets
-        brackets = self.contract.fetch_brackets(target_date)
         
         # 4. Run Edge Detection
         signals = self.edge_detector.analyze(
@@ -123,6 +132,10 @@ class WeatherBot:
             forecast_mean=adjusted.mean_temp_f,
             forecast_std=adjusted.std_dev,
             analyzed_at=datetime.now(),
+            raw_forecast_mean=combined.mean_temp_f if combined else None,
+            raw_forecast_std=combined.std_dev if combined else None,
+            adjusted_forecast_mean=adjusted.mean_temp_f,
+            adjusted_forecast_std=adjusted.std_dev,
             model_probabilities=model_probabilities,
             trajectory_assessment=adjusted.trajectory_assessment,
         )

@@ -30,6 +30,7 @@ from kalshi_weather.core import (
     BracketType,
     TrajectoryAssessment,
 )
+from kalshi_weather.data.stations import get_recent_observation_history
 from kalshi_weather.engine.trajectory import TrajectoryEngine
 
 logger = logging.getLogger(__name__)
@@ -560,19 +561,41 @@ class ObservationAdjuster:
         else:
             max_possible = max(high_f, observation.possible_actual_high_high)
 
+        assessment_time = current_time or datetime.now(self.timezone)
+        if assessment_time.tzinfo is None:
+            assessment_time = assessment_time.replace(tzinfo=self.timezone)
+        else:
+            assessment_time = assessment_time.astimezone(self.timezone)
+        recent_history = get_recent_observation_history(
+            readings=observation.readings,
+            timezone=self.timezone,
+            current_time=assessment_time,
+            window_size=6,
+            max_age_hours=4.0,
+        )
+
         trajectory = self.trajectory_engine.assess(
-            current_time=current_time or datetime.now(self.timezone),
+            current_time=assessment_time,
             observed_high_f=observation.observed_high_f,
-            recent_readings=observation.readings,
+            recent_readings=recent_history,
             combined_forecast=combined_forecast,
         )
 
-        latest_temp = observation.readings[-1].reported_temp_f if observation.readings else observation.observed_high_f
+        latest_temp = recent_history[-1].reported_temp_f if recent_history else observation.observed_high_f
+        latest_time = recent_history[-1].timestamp.astimezone(self.timezone) if recent_history else None
+        latest_age_hours = (
+            (assessment_time - latest_time).total_seconds() / 3600.0
+            if latest_time is not None
+            else float("inf")
+        )
+        stale_observation_window = latest_age_hours > 2.0
         lock_mode = (
             hours_since_noon >= LATE_CUTOFF_HOURS
+            and observation_weight >= 0.65
             and latest_temp < observation.observed_high_f
             and trajectory.trend_f_per_hour <= 0.0
             and trajectory.lock_confidence >= 0.75
+            and not stale_observation_window
         )
         conditioning_cutoff = observation.observed_high_f - 0.5
         conditioning_ceiling = None
@@ -590,14 +613,23 @@ class ObservationAdjuster:
                 0.3,
                 0.25 * trajectory.expected_remaining_warming_f,
             )
-        blend_weight = 0.45 + 0.45 * trajectory.lock_confidence
+
+        # Keep trajectory influence weak early, and increase as the day advances.
+        time_progress = max(0.0, min(1.0, hours_since_noon / 8.0))
+        blend_weight = (0.05 + 0.75 * trajectory.lock_confidence) * time_progress
+        if lock_mode:
+            blend_weight = max(0.75, blend_weight)
+        elif stale_observation_window:
+            # Avoid overreacting when recent station history is stale.
+            blend_weight *= 0.35
+
         conditioned_mean = (1.0 - blend_weight) * adjusted_mean + blend_weight * target_mean
         conditioned_mean = max(observation.observed_high_f, conditioned_mean)
 
-        std_scale = 1.0 - 0.55 * trajectory.lock_confidence
+        std_scale = 1.0 - 0.50 * blend_weight
         if lock_mode:
-            std_scale *= 0.55
-        conditioned_std = max(self.min_std_dev, adjusted_std * std_scale)
+            std_scale *= 0.70
+        conditioned_std = max(self.min_std_dev, adjusted_std * max(0.35, std_scale))
         low_f = max(conditioning_cutoff, conditioned_mean - z_10 * conditioned_std)
         high_f = conditioned_mean + z_10 * conditioned_std
         max_possible = max(max_possible, observation.observed_high_f + trajectory.expected_remaining_warming_f + conditioned_std)
@@ -605,7 +637,7 @@ class ObservationAdjuster:
         logger.info(
             f"Adjusted forecast: mean={conditioned_mean:.1f}°F (was {combined_forecast.mean_temp_f:.1f}°F), "
             f"std={conditioned_std:.2f}°F, obs_weight={observation_weight:.2f}, "
-            f"lock={trajectory.lock_confidence:.2f}, lock_mode={lock_mode}"
+            f"lock={trajectory.lock_confidence:.2f}, lock_mode={lock_mode}, stale_obs={stale_observation_window}"
         )
 
         return AdjustedForecast(
@@ -825,6 +857,14 @@ class BracketProbabilityCalculator:
                 edge_pct=edge * 100,
             ))
 
+        if results and self._is_exhaustive_structure(brackets):
+            total = sum(bp.model_prob for bp in results)
+            if total > 0:
+                for bp in results:
+                    bp.model_prob = max(0.0, min(1.0, bp.model_prob / total))
+                    bp.edge = bp.model_prob - bp.market_prob
+                    bp.edge_pct = bp.edge * 100
+
         # Log summary
         total_model_prob = sum(bp.model_prob for bp in results)
         logger.info(
@@ -893,6 +933,14 @@ class BracketProbabilityCalculator:
 
         conditioned = clipped_prob / norm
         return self._clamp_probability(conditioned)
+
+    def _is_exhaustive_structure(self, brackets: List[MarketBracket]) -> bool:
+        """
+        Heuristic check for standard Kalshi ladder structure covering all outcomes.
+        """
+        has_lt = any(b.bracket_type == BracketType.LESS_THAN for b in brackets)
+        has_gt = any(b.bracket_type == BracketType.GREATER_THAN for b in brackets)
+        return has_lt and has_gt and len(brackets) >= 3
 
     def calculate_from_adjusted_forecast(
         self,
