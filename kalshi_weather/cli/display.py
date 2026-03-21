@@ -42,8 +42,8 @@ class Dashboard:
 
         self.layout["left"].split(
             Layout(name="forecasts", ratio=1),
-            Layout(name="outcome", size=9),
-            Layout(name="observations", size=14),
+            Layout(name="outcome", size=8),
+            Layout(name="observations", size=11),
         )
 
         self.layout["right"].split(
@@ -73,17 +73,7 @@ class Dashboard:
         table.add_column("Source")
         table.add_column("Temp", justify="right")
         table.add_column("StdDev", justify="right")
-        
-        # Individual Forecasts
-        for f in analysis.forecasts:
-            table.add_row(
-                f.source,
-                f"{f.forecast_temp_f:.1f}°F",
-                f"{f.std_dev:.1f}°F"
-            )
-            
-        table.add_section()
-        
+
         raw_mean = analysis.raw_forecast_mean if analysis.raw_forecast_mean is not None else analysis.forecast_mean
         raw_std = analysis.raw_forecast_std if analysis.raw_forecast_std is not None else analysis.forecast_std
         adjusted_mean = (
@@ -97,48 +87,41 @@ class Dashboard:
             else analysis.forecast_std
         )
 
-        # Raw and adjusted model summary
+        # Forecast-only summary (kept de-emphasized)
         table.add_row(
             "[b]Forecast-Only Mean[/b]",
             f"{raw_mean:.1f}°F",
             f"{raw_std:.1f}°F",
             style="dim",
         )
+        table.add_section()
+
+        # Individual Forecasts
+        for f in analysis.forecasts:
+            table.add_row(
+                f.source,
+                f"{f.forecast_temp_f:.1f}°F",
+                f"{f.std_dev:.1f}°F",
+                style="dim",
+            )
+        table.add_section()
+
+        # Final model callout (placed below sources)
         table.add_row(
             "[b]Final Model Mean[/b]",
             f"[b]{adjusted_mean:.1f}°F[/b]",
-            f"{adjusted_std:.1f}°F",
-            style="yellow"
+            f"[b]{adjusted_std:.1f}°F[/b]",
+            style="bold black on bright_yellow",
         )
         delta = adjusted_mean - raw_mean
         table.add_row(
             "Adjustment",
             f"{delta:+.1f}°F",
             "",
-            style="magenta" if abs(delta) >= 2.0 else "dim",
+            style="dim",
         )
 
-        summary_note = None
-        mean_gap = abs(adjusted_mean - raw_mean)
-        if mean_gap >= 2.0:
-            obs = analysis.observation.observed_high_f if analysis.observation else None
-            lock = analysis.trajectory_assessment.lock_confidence if analysis.trajectory_assessment else None
-            if obs is not None and lock is not None:
-                summary_note = (
-                    f"Shift driver: observed high so far {obs:.1f}°F with lock confidence "
-                    f"{lock:.0%}. Final model favors settlement near observed high."
-                )
-            else:
-                summary_note = (
-                    "Final model shifted from forecast-only using live observations/"
-                    "trajectory logic. Use Final Model Mean for decision support."
-                )
-
-        body = Group(table) if summary_note is None else Group(
-            table,
-            Text(f"\n{summary_note}", style="dim"),
-        )
-        return Panel(body, title="Weather Forecasts", border_style="cyan")
+        return Panel(table, title="Weather Forecasts", border_style="cyan")
 
     def generate_observation_panel(self, analysis: MarketAnalysis) -> Panel:
         """Create observation summary."""
