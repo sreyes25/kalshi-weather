@@ -98,6 +98,23 @@ def _fixed_point_to_float(value: Any) -> Optional[float]:
     return numeric
 
 
+def _to_float_value(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 # Regex patterns for parsing bracket subtitles
 BETWEEN_PATTERN = re.compile(
     r"(\d+)°?\s*(?:F)?\s*to\s*(\d+)°?\s*(?:F)?",
@@ -473,13 +490,8 @@ class KalshiMarketClient(MarketDataSource):
                 average_entry = avg_yes
             elif side_raw == "NO" and avg_no is not None:
                 average_entry = avg_no
-        if average_entry is None and contracts > 0:
-            total_traded_cents = self._to_cents(raw.get("total_traded_dollars"))
-            exposure_cents = self._to_cents(raw.get("market_exposure_dollars"))
-            if total_traded_cents is not None and total_traded_cents > 0:
-                average_entry = int(round(total_traded_cents / contracts))
-            elif exposure_cents is not None and exposure_cents > 0:
-                average_entry = int(round(exposure_cents / contracts))
+        # Do not infer entry from exposure/turnover fields; these can be cumulative
+        # and may not represent current average open price after partial exits.
 
         return {
             "ticker": market_ticker,
@@ -542,11 +554,256 @@ class KalshiMarketClient(MarketDataSource):
             parsed_row["last_price"] = self._to_cents(detail.get("last_price_dollars"))
             if parsed_row["last_price"] is None:
                 parsed_row["last_price"] = self._to_cents(detail.get("last_price"))
-            if parsed_row.get("average_entry_price_cents") is None:
-                parsed_row["average_entry_price_cents"] = parsed_row.get("last_price")
             parsed.append(parsed_row)
 
         return parsed
+
+    def fetch_portfolio_totals(
+        self,
+        event_ticker: Optional[str] = None,
+    ) -> Dict[str, float]:
+        """
+        Aggregate realized/fee/traded totals for current portfolio positions.
+
+        If event_ticker is provided, rows are filtered to that event.
+        """
+        if not self.api_key:
+            return {}
+        if self._load_private_key() is None:
+            return {}
+
+        request_path = "/trade-api/v2/portfolio/positions"
+        statuses = ("open", "closed")
+        rows: List[Dict[str, Any]] = []
+        for status in statuses:
+            try:
+                response = requests.get(
+                    f"{KALSHI_API_BASE}/portfolio/positions",
+                    params={"status": status, "limit": 200},
+                    headers=self._get_signed_headers("GET", request_path),
+                    timeout=API_TIMEOUT,
+                )
+                response.raise_for_status()
+                payload = response.json()
+            except requests.exceptions.RequestException:
+                continue
+            except (ValueError, TypeError):
+                continue
+            for raw in self._extract_open_positions_payload(payload):
+                if isinstance(raw, dict):
+                    rows.append(raw)
+
+        if not rows:
+            return {}
+
+        realized = 0.0
+        fees = 0.0
+        traded = 0.0
+        exposure = 0.0
+        matched_rows = 0
+        seen = set()
+
+        for row in rows:
+            row_event = str(row.get("event_ticker") or "").strip()
+            if event_ticker and row_event and row_event != event_ticker:
+                continue
+            ticker = str(self._pick_first(row, ["ticker", "market_ticker", "instrument_ticker"]) or "")
+            side = str(self._pick_first(row, ["side", "position_side", "direction"]) or "")
+            signature = (
+                ticker,
+                side,
+                str(row.get("position") or row.get("contracts") or row.get("position_fp") or ""),
+                f"{_to_float_value(row.get('realized_pnl_dollars'))}",
+                f"{_to_float_value(row.get('fees_paid_dollars'))}",
+            )
+            if signature in seen:
+                continue
+            seen.add(signature)
+            matched_rows += 1
+            realized += _to_float_value(row.get("realized_pnl_dollars")) or 0.0
+            fees += _to_float_value(row.get("fees_paid_dollars")) or 0.0
+            traded += _to_float_value(row.get("total_traded_dollars")) or 0.0
+            exposure += _to_float_value(row.get("market_exposure_dollars")) or 0.0
+
+        if matched_rows == 0:
+            return {}
+        return {
+            "realized_pnl_dollars": realized,
+            "fees_paid_dollars": fees,
+            "total_traded_dollars": traded,
+            "market_exposure_dollars": exposure,
+            "net_realized_after_fees_dollars": realized - fees,
+            "markets_count": float(matched_rows),
+        }
+
+    def fetch_resting_orders(self, ticker: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Fetch currently resting orders for dedupe checks."""
+        if not self.api_key:
+            return []
+        if self._load_private_key() is None:
+            return []
+
+        request_path = "/trade-api/v2/portfolio/orders"
+        params: Dict[str, Any] = {"status": "resting", "limit": 200}
+        if ticker:
+            params["ticker"] = ticker
+        try:
+            response = requests.get(
+                f"{KALSHI_API_BASE}/portfolio/orders",
+                params=params,
+                headers=self._get_signed_headers("GET", request_path),
+                timeout=API_TIMEOUT,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.exceptions.RequestException as exc:
+            logger.warning("Failed to fetch resting orders: %s", exc)
+            return []
+        except (ValueError, TypeError) as exc:
+            logger.warning("Failed to parse resting orders response: %s", exc)
+            return []
+
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(data, dict):
+            payload = data
+        for key in ("orders", "resting_orders", "portfolio_orders"):
+            rows = payload.get(key) if isinstance(payload, dict) else None
+            if isinstance(rows, list):
+                return rows
+        return []
+
+    def place_reduce_only_sell_limit(
+        self,
+        ticker: str,
+        side: str,
+        count: int,
+        limit_price_cents: int,
+        client_order_id: str,
+    ) -> Tuple[bool, str]:
+        """
+        Place a reduce-only limit sell order.
+
+        side must be YES/NO from position perspective.
+        """
+        if not self.api_key:
+            return (False, "missing API key")
+        if self._load_private_key() is None:
+            return (False, "missing/invalid private key")
+        side_l = side.lower()
+        if side_l not in {"yes", "no"}:
+            return (False, f"invalid side: {side}")
+        if count <= 0:
+            return (False, "count must be > 0")
+        limit_price_cents = max(1, min(99, int(limit_price_cents)))
+
+        request_path = "/trade-api/v2/portfolio/orders"
+        base_payload: Dict[str, Any] = {
+            "ticker": ticker,
+            "action": "sell",
+            "side": side_l,
+            "type": "limit",
+            "count": int(count),
+            "reduce_only": True,
+            "client_order_id": client_order_id,
+        }
+        if side_l == "yes":
+            base_payload["yes_price"] = limit_price_cents
+        else:
+            base_payload["no_price"] = limit_price_cents
+
+        payload_variants: List[Tuple[str, Dict[str, Any]]] = [
+            (
+                "time_in_force=immediate_or_cancel",
+                {**base_payload, "time_in_force": "immediate_or_cancel"},
+            ),
+            (
+                "time_in_force=IMMEDIATE_OR_CANCEL",
+                {**base_payload, "time_in_force": "IMMEDIATE_OR_CANCEL"},
+            ),
+            ("time_in_force=ioc", {**base_payload, "time_in_force": "ioc"}),
+            ("time_in_force=IOC", {**base_payload, "time_in_force": "IOC"}),
+            ("timeInForce=immediate_or_cancel", {**base_payload, "timeInForce": "immediate_or_cancel"}),
+            ("timeInForce=ioc", {**base_payload, "timeInForce": "ioc"}),
+            ("timeInForce=IOC", {**base_payload, "timeInForce": "IOC"}),
+        ]
+
+        last_error = "unknown order error"
+        for variant_name, payload in payload_variants:
+            try:
+                response = requests.post(
+                    f"{KALSHI_API_BASE}/portfolio/orders",
+                    json=payload,
+                    headers=self._get_signed_headers("POST", request_path),
+                    timeout=API_TIMEOUT,
+                )
+                if response.status_code == 409:
+                    # Usually means duplicate client_order_id.
+                    logger.info("Order skipped (duplicate client_order_id): %s", client_order_id)
+                    return (True, "duplicate client_order_id (already placed)")
+                if response.status_code >= 400:
+                    body = response.text[:400]
+                    last_error = f"{variant_name} -> HTTP {response.status_code}: {body}"
+                    # Retry across variants on known schema/value order-validation mismatches.
+                    if response.status_code == 400 and (
+                        ("TimeInForce" in body and "oneof" in body)
+                        or ("reduce_only can only be used with IoC orders" in body)
+                        or ("invalid_parameters" in body)
+                        or ("invalid_order" in body)
+                    ):
+                        continue
+                response.raise_for_status()
+                return (True, f"ok ({variant_name})")
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else "unknown"
+                body = exc.response.text[:400] if exc.response is not None else ""
+                last_error = f"{variant_name} -> HTTP {status}: {body}"
+                if status == 400:
+                    # Keep probing alternate payload shapes for 400 validation errors.
+                    continue
+                logger.warning("Failed to place order (%s): %s", ticker, last_error)
+                break
+            except requests.exceptions.RequestException as exc:
+                last_error = f"{variant_name} -> {exc}"
+                logger.warning("Failed to place order (%s): %s", ticker, exc)
+                break
+
+        return (False, last_error)
+
+    def has_resting_reduce_like_order(
+        self,
+        ticker: str,
+        side: str,
+        price_cents: int,
+    ) -> bool:
+        """
+        Check whether a similar resting sell order already exists.
+        """
+        orders = self.fetch_resting_orders(ticker=ticker)
+        side_l = side.lower()
+        for order in orders:
+            try:
+                if str(order.get("ticker", "")).strip() != ticker:
+                    continue
+                if str(order.get("action", "")).strip().lower() != "sell":
+                    continue
+                if str(order.get("side", "")).strip().lower() != side_l:
+                    continue
+                if not _to_bool(order.get("reduce_only", True)):
+                    continue
+                existing_price = None
+                if side_l == "yes":
+                    existing_price = self._to_cents(order.get("yes_price"))
+                else:
+                    existing_price = self._to_cents(order.get("no_price"))
+                if existing_price is None:
+                    existing_price = self._to_cents(order.get("price"))
+                if existing_price is None:
+                    continue
+                if int(existing_price) == int(price_cents):
+                    return True
+            except Exception:
+                continue
+        return False
 
     def fetch_brackets(self, target_date: str) -> List[MarketBracket]:
         """Fetch all brackets for a target date's temperature market."""

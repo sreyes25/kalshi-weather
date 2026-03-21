@@ -138,10 +138,14 @@ def cities():
 
 @main.command()
 @click.option("--city", "-c", default="NYC", help="City code (NYC, CHI, LAX, MIA, AUS)")
-def run(city: str):
+@click.option("--refresh", "-r", default=None, type=int, help="Refresh interval in seconds")
+def run(city: str, refresh: int | None):
     """Run the interactive dashboard bot."""
     from kalshi_weather.cli.bot import run_bot
-    run_bot(city)
+    if refresh is None:
+        run_bot(city)
+    else:
+        run_bot(city, refresh_interval=max(5, refresh))
 
 
 @main.command("view-graph")

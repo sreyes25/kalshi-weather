@@ -68,6 +68,25 @@ MIN_STD_DEV: float = 1.5
 MAX_STD_DEV: float = 10.0
 
 
+def _safe_linear_trend_per_hour(values: List[tuple[float, float]]) -> float:
+    """
+    Compute slope per hour from (hours_since_start, value) pairs.
+    """
+    if len(values) < 2:
+        return 0.0
+    xs = [p[0] for p in values]
+    ys = [p[1] for p in values]
+    span = xs[-1] - xs[0]
+    if span <= 0.0:
+        return 0.0
+    x_mean = sum(xs) / len(xs)
+    y_mean = sum(ys) / len(ys)
+    denom = sum((x - x_mean) ** 2 for x in xs)
+    if denom <= 1e-9:
+        return 0.0
+    return sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys)) / denom
+
+
 # =============================================================================
 # DATA CLASSES
 # =============================================================================
@@ -644,6 +663,21 @@ class ObservationAdjuster:
             if latest_time is not None
             else float("inf")
         )
+        anchor_time = recent_history[0].timestamp if recent_history else None
+        temp_points: List[tuple[float, float]] = []
+        dew_points: List[tuple[float, float]] = []
+        rh_points: List[tuple[float, float]] = []
+        if anchor_time is not None:
+            for row in recent_history:
+                x = (row.timestamp - anchor_time).total_seconds() / 3600.0
+                temp_points.append((x, row.reported_temp_f))
+                if row.dewpoint_f is not None:
+                    dew_points.append((x, row.dewpoint_f))
+                if row.relative_humidity_pct is not None:
+                    rh_points.append((x, row.relative_humidity_pct))
+        dew_trend_f_per_hour = _safe_linear_trend_per_hour(dew_points)
+        rh_trend_pct_per_hour = _safe_linear_trend_per_hour(rh_points)
+        temp_trend_f_per_hour = _safe_linear_trend_per_hour(temp_points)
         stale_observation_window = latest_age_hours > 2.0
         lock_mode = (
             hours_since_noon >= LATE_CUTOFF_HOURS
@@ -673,6 +707,12 @@ class ObservationAdjuster:
         # Keep trajectory influence weak early, and increase as the day advances.
         time_progress = max(0.0, min(1.0, hours_since_noon / 8.0))
         blend_weight = (0.05 + 0.75 * trajectory.lock_confidence) * time_progress
+        # High-frequency nowcast boost:
+        # when station readings are fresh, give observations more influence even before late day.
+        if latest_age_hours <= 0.35:
+            blend_weight = max(blend_weight, 0.22)
+        elif latest_age_hours <= 0.75:
+            blend_weight = max(blend_weight, 0.15)
         if lock_mode:
             blend_weight = max(0.75, blend_weight)
         elif stale_observation_window:
@@ -681,6 +721,22 @@ class ObservationAdjuster:
 
         conditioned_mean = (1.0 - blend_weight) * adjusted_mean + blend_weight * target_mean
         conditioned_mean = max(observation.observed_high_f, conditioned_mean)
+
+        # Humidity/dewpoint nowcast nudge:
+        # rising dewpoint + rising RH tends to support persistence; falling both
+        # tends to support cooling/lock behavior. Keep influence deliberately small.
+        humidity_nudge = 0.0
+        if latest_age_hours <= 1.5 and len(dew_points) >= 2 and len(rh_points) >= 2:
+            if dew_trend_f_per_hour >= 0.5 and rh_trend_pct_per_hour >= 1.5:
+                humidity_nudge += 0.18
+            elif dew_trend_f_per_hour <= -0.5 and rh_trend_pct_per_hour <= -1.5:
+                humidity_nudge -= 0.18
+            if temp_trend_f_per_hour >= 0.25 and dew_trend_f_per_hour > 0.0:
+                humidity_nudge += 0.07
+            elif temp_trend_f_per_hour <= -0.25 and dew_trend_f_per_hour < 0.0:
+                humidity_nudge -= 0.07
+        humidity_nudge = max(-0.30, min(0.30, humidity_nudge))
+        conditioned_mean = max(observation.observed_high_f, conditioned_mean + humidity_nudge)
 
         std_scale = 1.0 - 0.50 * blend_weight
         if lock_mode:
@@ -693,7 +749,9 @@ class ObservationAdjuster:
         logger.info(
             f"Adjusted forecast: mean={conditioned_mean:.1f}°F (was {combined_forecast.mean_temp_f:.1f}°F), "
             f"std={conditioned_std:.2f}°F, obs_weight={observation_weight:.2f}, "
-            f"lock={trajectory.lock_confidence:.2f}, lock_mode={lock_mode}, stale_obs={stale_observation_window}"
+            f"lock={trajectory.lock_confidence:.2f}, lock_mode={lock_mode}, stale_obs={stale_observation_window}, "
+            f"dew_trend={dew_trend_f_per_hour:+.2f}F/hr, rh_trend={rh_trend_pct_per_hour:+.2f}%/hr, "
+            f"humidity_nudge={humidity_nudge:+.2f}F"
         )
 
         return AdjustedForecast(

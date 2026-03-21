@@ -76,6 +76,8 @@ class StationReading:
     reported_temp_c: Optional[float]  # The Celsius value if available
     possible_actual_f_low: float   # Lower bound of actual temp
     possible_actual_f_high: float  # Upper bound of actual temp
+    dewpoint_f: Optional[float] = None
+    relative_humidity_pct: Optional[float] = None
 
 
 @dataclass
@@ -172,8 +174,14 @@ class PositionRecommendation:
     position: OpenPosition
     model_yes_probability: Optional[float]
     side_probability: Optional[float]
+    side_probability_change_pp: Optional[float]
+    is_primary_outcome_position: bool
+    top_model_probability: Optional[float]
+    primary_gap_pp: Optional[float]
     fair_value_cents: Optional[float]
+    trend_adjusted_fair_value_cents: Optional[float]
     liquidation_price_cents: Optional[int]
+    liquidation_net_cents: Optional[float]
     edge_vs_liquidation_cents: Optional[float]
     action: str
     target_exit_price_cents: Optional[int]
@@ -219,7 +227,10 @@ class MarketAnalysis:
     tomorrow_forecast_mean: Optional[float] = None # Forecast-only mean for tomorrow
     model_probabilities: Dict[str, float] = field(default_factory=dict)  # ticker -> probability
     open_positions: List[PositionRecommendation] = field(default_factory=list)
+    auto_trader_events: List[str] = field(default_factory=list)
+    position_lifecycle_events: List[str] = field(default_factory=list)
     trajectory_assessment: Optional[TrajectoryAssessment] = None
+    portfolio_totals: Dict[str, float] = field(default_factory=dict)
 
 
 # =============================================================================

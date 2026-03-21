@@ -109,3 +109,32 @@ class HighTempContract(BaseContract):
                 )
             )
         return positions
+
+    def fetch_portfolio_totals(self, event_ticker: Optional[str] = None) -> dict:
+        """Fetch aggregated portfolio totals (realized/fees/traded/exposure)."""
+        return self._market_client.fetch_portfolio_totals(event_ticker=event_ticker)
+
+    def place_reduce_only_sell_limit(
+        self,
+        ticker: str,
+        side: str,
+        count: int,
+        limit_price_cents: int,
+        client_order_id: str,
+    ) -> tuple[bool, str]:
+        """Place a reduce-only limit sell order."""
+        return self._market_client.place_reduce_only_sell_limit(
+            ticker=ticker,
+            side=side,
+            count=count,
+            limit_price_cents=limit_price_cents,
+            client_order_id=client_order_id,
+        )
+
+    def has_resting_reduce_like_order(self, ticker: str, side: str, price_cents: int) -> bool:
+        """Check whether a matching resting reduce-only sell order already exists."""
+        return self._market_client.has_resting_reduce_like_order(
+            ticker=ticker,
+            side=side,
+            price_cents=price_cents,
+        )

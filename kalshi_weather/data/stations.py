@@ -6,7 +6,7 @@ temperature uncertainty bounds.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from zoneinfo import ZoneInfo
 
@@ -96,6 +96,8 @@ def parse_observation(obs: dict, station_type: StationType, station_id: str) -> 
         temp_data = properties.get("temperature", {})
         temp_value = temp_data.get("value")
         unit_code = temp_data.get("unitCode", "")
+        dewpoint_data = properties.get("dewpoint", {})
+        humidity_data = properties.get("relativeHumidity", {})
 
         if temp_value is None:
             return None
@@ -112,6 +114,27 @@ def parse_observation(obs: dict, station_type: StationType, station_id: str) -> 
 
         low_f, high_f = calculate_temp_bounds(temp_c, temp_f, station_type)
 
+        dewpoint_f: Optional[float] = None
+        dewpoint_value = dewpoint_data.get("value")
+        dewpoint_unit = str(dewpoint_data.get("unitCode", "")).lower()
+        if dewpoint_value is not None:
+            try:
+                dew_raw = float(dewpoint_value)
+                if "degf" in dewpoint_unit or "fahrenheit" in dewpoint_unit:
+                    dewpoint_f = round(dew_raw, 1)
+                else:
+                    dewpoint_f = round(celsius_to_fahrenheit(dew_raw), 1)
+            except (TypeError, ValueError):
+                dewpoint_f = None
+
+        relative_humidity_pct: Optional[float] = None
+        humidity_value = humidity_data.get("value")
+        if humidity_value is not None:
+            try:
+                relative_humidity_pct = round(float(humidity_value), 1)
+            except (TypeError, ValueError):
+                relative_humidity_pct = None
+
         return StationReading(
             station_id=station_id,
             timestamp=timestamp,
@@ -120,6 +143,8 @@ def parse_observation(obs: dict, station_type: StationType, station_id: str) -> 
             reported_temp_c=round(temp_c, 1) if temp_c is not None else None,
             possible_actual_f_low=round(low_f, 1),
             possible_actual_f_high=round(high_f, 1),
+            dewpoint_f=dewpoint_f,
+            relative_humidity_pct=relative_humidity_pct,
         )
     except (ValueError, TypeError, KeyError) as e:
         logger.warning(f"Failed to parse observation: {e}")
@@ -189,11 +214,56 @@ class NWSStationParser(StationDataSource):
         """Return headers for NWS API requests."""
         return {"User-Agent": NWS_USER_AGENT}
 
-    def _fetch_raw_observations(self, limit: int = 100) -> List[dict]:
+    def _to_nws_rfc3339(self, dt: datetime) -> str:
+        """
+        Format datetimes for api.weather.gov query params.
+
+        NWS is strict here; avoid fractional seconds to prevent 400 responses.
+        """
+        return dt.astimezone(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _parse_obs_timestamp(self, obs: dict) -> Optional[datetime]:
+        timestamp = obs.get("properties", {}).get("timestamp")
+        if not timestamp:
+            return None
+        try:
+            return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    def _fetch_latest_observation(self) -> Optional[dict]:
+        """Fetch latest single observation and return as feature-like dict."""
+        try:
+            url = f"{NWS_STATIONS_URL.format(station_id=self.station_id)}/latest"
+            response = requests.get(
+                url,
+                headers=self._get_headers(),
+                timeout=API_TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
+            if isinstance(data, dict) and "properties" in data:
+                return data
+            return None
+        except requests.exceptions.RequestException:
+            return None
+        except (ValueError, KeyError):
+            return None
+
+    def _fetch_raw_observations(
+        self,
+        limit: int = 500,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+    ) -> List[dict]:
         """Fetch raw observations from NWS API."""
         try:
             url = NWS_STATIONS_URL.format(station_id=self.station_id)
             params = {"limit": limit}
+            if start is not None:
+                params["start"] = self._to_nws_rfc3339(start)
+            if end is not None:
+                params["end"] = self._to_nws_rfc3339(end)
 
             response = requests.get(
                 url,
@@ -205,6 +275,32 @@ class NWSStationParser(StationDataSource):
             data = response.json()
 
             features = data.get("features", [])
+            # If day-window query returns empty, retry once without window
+            # so we still have usable observations for intraday display.
+            if not features and (start is not None or end is not None):
+                retry_response = requests.get(
+                    url,
+                    params={"limit": limit},
+                    headers=self._get_headers(),
+                    timeout=API_TIMEOUT,
+                )
+                retry_response.raise_for_status()
+                retry_data = retry_response.json()
+                features = retry_data.get("features", [])
+            latest = self._fetch_latest_observation()
+            if latest:
+                latest_ts = self._parse_obs_timestamp(latest)
+                existing_timestamps = {
+                    self._parse_obs_timestamp(f) for f in features if isinstance(f, dict)
+                }
+                if latest_ts is not None and latest_ts not in existing_timestamps:
+                    features.append(latest)
+
+            features = [f for f in features if isinstance(f, dict)]
+            features.sort(
+                key=lambda f: self._parse_obs_timestamp(f) or datetime.min.replace(tzinfo=ZoneInfo("UTC")),
+                reverse=True,
+            )
             self._cached_observations = features
             self._last_fetch = datetime.now(self.timezone)
 
@@ -214,9 +310,21 @@ class NWSStationParser(StationDataSource):
             return features
         except requests.exceptions.RequestException as e:
             logger.warning(f"Failed to fetch NWS observations: {e}")
+            if self._cached_observations:
+                logger.warning(
+                    "Using cached NWS observations (%d rows) due to fetch failure.",
+                    len(self._cached_observations),
+                )
+                return list(self._cached_observations)
             return []
         except (ValueError, KeyError) as e:
             logger.warning(f"Failed to parse NWS observations response: {e}")
+            if self._cached_observations:
+                logger.warning(
+                    "Using cached NWS observations (%d rows) due to parse failure.",
+                    len(self._cached_observations),
+                )
+                return list(self._cached_observations)
             return []
 
     def fetch_current_observations(self) -> List[StationReading]:
@@ -238,12 +346,29 @@ class NWSStationParser(StationDataSource):
 
     def get_daily_summary(self, date: str) -> Optional[DailyObservation]:
         """Get aggregated observation data for a specific date."""
-        readings = self.fetch_current_observations()
+        target_date = datetime.strptime(date, "%Y-%m-%d").date()
+        day_start_local = datetime.combine(target_date, datetime.min.time(), self.timezone)
+        day_end_local = day_start_local + timedelta(days=1)
+        now_local = datetime.now(self.timezone)
+        fetch_end = min(day_end_local, now_local + timedelta(minutes=5))
+
+        raw_observations = self._fetch_raw_observations(
+            limit=500,
+            start=day_start_local,
+            end=fetch_end,
+        )
+        if not raw_observations:
+            return None
+        station_type = self._station_type or StationType.UNKNOWN
+        readings: List[StationReading] = []
+        for obs in raw_observations:
+            reading = parse_observation(obs, station_type, self.station_id)
+            if reading:
+                readings.append(reading)
 
         if not readings:
             return None
 
-        target_date = datetime.strptime(date, "%Y-%m-%d").date()
         daily_readings = [
             r for r in readings
             if r.timestamp.astimezone(self.timezone).date() == target_date

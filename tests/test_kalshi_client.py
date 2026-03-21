@@ -339,7 +339,7 @@ class TestKalshiMarketClient:
         assert rows[0]["ticker"] == f"{EVENT_TICKER}-B54"
         assert rows[0]["contracts"] == 1
         assert rows[0]["side"] == "YES"
-        assert rows[0]["average_entry_price_cents"] == 550
+        assert rows[0]["average_entry_price_cents"] is None
 
 
 # =============================================================================

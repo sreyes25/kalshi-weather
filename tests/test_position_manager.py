@@ -39,6 +39,7 @@ def test_evaluate_open_positions_recommends_hold_when_fair_above_liquidation():
 
     assert recs[0].action == "HOLD"
     assert recs[0].target_exit_price_cents >= 55
+    assert recs[0].is_primary_outcome_position is True
 
 
 def test_evaluate_open_positions_no_side_uses_inverse_for_no_contracts():
@@ -75,3 +76,23 @@ def test_evaluate_open_positions_handles_missing_model_probability():
     recs = evaluate_open_positions(positions, model_probabilities={})
 
     assert recs[0].action == "NO_MODEL"
+
+
+def test_evaluate_open_positions_includes_side_probability_trend():
+    positions = [
+        OpenPosition(
+            ticker="TEST-TREND",
+            side="YES",
+            contracts=2,
+            average_entry_price_cents=24,
+            yes_bid=27,
+            yes_ask=29,
+        )
+    ]
+    recs = evaluate_open_positions(
+        positions,
+        model_probabilities={"TEST-TREND": 0.31},
+        previous_model_probabilities={"TEST-TREND": 0.27},
+    )
+    assert recs[0].side_probability_change_pp is not None
+    assert recs[0].side_probability_change_pp > 0

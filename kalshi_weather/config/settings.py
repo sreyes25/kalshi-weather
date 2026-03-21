@@ -68,6 +68,31 @@ DEFAULT_STD_DEV = float(os.getenv("DEFAULT_STD_DEV", "2.5"))  # °F
 # =============================================================================
 
 DEFAULT_REFRESH_INTERVAL = int(os.getenv("DEFAULT_REFRESH_INTERVAL", "60"))  # seconds
+CRITICAL_REEVAL_START_MINUTE = int(os.getenv("CRITICAL_REEVAL_START_MINUTE", "51"))
+CRITICAL_REEVAL_END_MINUTE = int(os.getenv("CRITICAL_REEVAL_END_MINUTE", "54"))
+CRITICAL_REEVAL_REFRESH_INTERVAL = int(os.getenv("CRITICAL_REEVAL_REFRESH_INTERVAL", "5"))
+
+# =============================================================================
+# AUTO-TRADING SAFETY FLAGS
+# =============================================================================
+
+AUTO_SELL_ENABLED = os.getenv("AUTO_SELL_ENABLED", "false").lower() == "true"
+AUTO_SELL_DRY_RUN = os.getenv("AUTO_SELL_DRY_RUN", "true").lower() == "true"
+AUTO_SELL_ON_WRONG_POSITION = os.getenv("AUTO_SELL_ON_WRONG_POSITION", "true").lower() == "true"
+AUTO_SELL_PLACE_TARGETS = os.getenv("AUTO_SELL_PLACE_TARGETS", "false").lower() == "true"
+AUTO_SELL_MAX_CONTRACTS = int(os.getenv("AUTO_SELL_MAX_CONTRACTS", "250"))
+POSITION_EXIT_FEE_RATE = float(os.getenv("POSITION_EXIT_FEE_RATE", "0.02"))
+AUTO_SELL_MIN_PROFIT_CENTS = float(os.getenv("AUTO_SELL_MIN_PROFIT_CENTS", "1.0"))
+AUTO_SELL_START_HOUR_LOCAL = int(os.getenv("AUTO_SELL_START_HOUR_LOCAL", "15"))
+AUTO_SELL_START_MINUTE_LOCAL = int(os.getenv("AUTO_SELL_START_MINUTE_LOCAL", "0"))
+AUTO_SELL_MIN_NON_PRIMARY_CYCLES = int(os.getenv("AUTO_SELL_MIN_NON_PRIMARY_CYCLES", "1"))
+# Ambiguity buffer: require a clear model lead over this position before auto-sell.
+# Helps avoid churn when mean is near a bracket boundary (e.g. 56.5 between adjacent bins).
+AUTO_SELL_MIN_PRIMARY_GAP_PP = float(os.getenv("AUTO_SELL_MIN_PRIMARY_GAP_PP", "6.0"))
+AUTO_SELL_FORCE_EXIT_HOUR_LOCAL = int(os.getenv("AUTO_SELL_FORCE_EXIT_HOUR_LOCAL", "16"))
+AUTO_SELL_FORCE_EXIT_MINUTE_LOCAL = int(os.getenv("AUTO_SELL_FORCE_EXIT_MINUTE_LOCAL", "0"))
+AUTO_SELL_MIN_HOLD_MINUTES = int(os.getenv("AUTO_SELL_MIN_HOLD_MINUTES", "30"))
+AUTO_SELL_MAX_DRAWDOWN_FRACTION = float(os.getenv("AUTO_SELL_MAX_DRAWDOWN_FRACTION", "0.50"))
 
 
 # =============================================================================
