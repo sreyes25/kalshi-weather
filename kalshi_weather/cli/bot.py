@@ -21,6 +21,7 @@ from kalshi_weather.data.stations import NWSStationParser
 from kalshi_weather.engine.edge_detector import EdgeDetector
 from kalshi_weather.engine.calibration import ForecastCalibrator
 from kalshi_weather.cli.display import Dashboard
+from kalshi_weather.utils.temperature_logs import DailyTemperatureLogger
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ class WeatherBot:
         self.weather_source = CombinedWeatherSource(city=self.city_config)
         self.station_source = NWSStationParser(city=self.city_config)
         self.contract = HighTempContract(self.city_config) 
+        self.temperature_logger = DailyTemperatureLogger(city_code=city_code)
 
     def run(self):
         """Start the main loop."""
@@ -51,6 +53,7 @@ class WeatherBot:
             while True:
                 try:
                     analysis = self.perform_analysis()
+                    self.temperature_logger.append_snapshot(analysis)
                     self.dashboard.update(analysis)
                     
                     # Sleep with countdown? Or just sleep.

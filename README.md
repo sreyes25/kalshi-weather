@@ -29,11 +29,42 @@ It aggregates weather forecasts (NWS, Open-Meteo), tracks live station data from
     python -m kalshi_weather run
     ```
 
+### Intraday Temperature Progression Logs
+
+When the bot is running, it now appends a row every refresh cycle to:
+
+`logs/temperature_progression/<CITY>/<YYYY-MM-DD>.csv`
+
+Example:
+
+`logs/temperature_progression/NYC/2026-03-21.csv`
+
+Each daily file includes both progression lines you can graph:
+- `observed_high_f` (live observed high progression)
+- `final_model_mean` (final adjusted model mean progression)
+
+To watch that line graph live in your terminal:
+
+```bash
+# Terminal 1: keep bot writing rows
+python -m kalshi_weather run --city NYC
+
+# Terminal 2: live line graph viewer
+python -m kalshi_weather view-graph --city NYC --refresh 15
+```
+
+To render one snapshot and exit:
+
+```bash
+python -m kalshi_weather view-graph --city NYC --once
+```
+
 ## CLI Commands
 
 | Command | Description |
 |---------|-------------|
 | `run` | Launch the interactive trading dashboard |
+| `view-graph` | View live intraday line graph from daily CSV logs |
 | `status` | Check market status and available dates |
 | `brackets` | Display current market brackets and prices |
 | `forecasts` | Show weather forecasts from all sources |

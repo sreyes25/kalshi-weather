@@ -144,6 +144,23 @@ def run(city: str):
     run_bot(city)
 
 
+@main.command("view-graph")
+@click.option("--city", "-c", default="NYC", help="City code (NYC, CHI, LAX, MIA, AUS)")
+@click.option("--date", "-d", default=None, help="Date to view (YYYY-MM-DD), defaults to today")
+@click.option("--refresh", "-r", default=30, type=int, help="Refresh interval in seconds")
+@click.option("--once", is_flag=True, help="Render one snapshot and exit")
+def view_graph(city: str, date: str, refresh: int, once: bool):
+    """View intraday temperature progression as a live terminal line graph."""
+    from kalshi_weather.cli.progression_graph import run_temperature_progression_viewer
+
+    run_temperature_progression_viewer(
+        city_code=city,
+        target_date=date,
+        refresh_seconds=max(1, refresh),
+        once=once,
+    )
+
+
 @main.command()
 @click.option("--city", "-c", default="NYC", help="City code (NYC, CHI, LAX, MIA, AUS)")
 @click.option("--date", "-d", default=None, help="Target date (YYYY-MM-DD), defaults to yesterday")
