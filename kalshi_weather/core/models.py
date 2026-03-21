@@ -149,6 +149,38 @@ class TradingSignal:
 
 
 @dataclass
+class OpenPosition:
+    """
+    A currently open account position in a Kalshi market.
+    """
+    ticker: str
+    side: str                      # "YES" or "NO"
+    contracts: int                 # Open quantity
+    average_entry_price_cents: Optional[int] # Average fill/open price for this side
+    event_ticker: Optional[str] = None
+    subtitle: Optional[str] = None
+    yes_bid: Optional[int] = None
+    yes_ask: Optional[int] = None
+    last_price: Optional[int] = None
+
+
+@dataclass
+class PositionRecommendation:
+    """
+    Deterministic recommendation for managing an open position.
+    """
+    position: OpenPosition
+    model_yes_probability: Optional[float]
+    side_probability: Optional[float]
+    fair_value_cents: Optional[float]
+    liquidation_price_cents: Optional[int]
+    edge_vs_liquidation_cents: Optional[float]
+    action: str
+    target_exit_price_cents: Optional[int]
+    rationale: str
+
+
+@dataclass
 class TrajectoryAssessment:
     """
     Intraday trajectory-based assessment of whether the daily high is likely set.
@@ -186,6 +218,7 @@ class MarketAnalysis:
     tomorrow_date: Optional[str] = None            # YYYY-MM-DD reference
     tomorrow_forecast_mean: Optional[float] = None # Forecast-only mean for tomorrow
     model_probabilities: Dict[str, float] = field(default_factory=dict)  # ticker -> probability
+    open_positions: List[PositionRecommendation] = field(default_factory=list)
     trajectory_assessment: Optional[TrajectoryAssessment] = None
 
 

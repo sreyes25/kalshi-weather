@@ -20,6 +20,7 @@ from kalshi_weather.data.stations import NWSStationParser
 # from kalshi_weather.data.markets import KalshiMarketSource # Assuming this exists or using Contract class
 from kalshi_weather.engine.edge_detector import EdgeDetector
 from kalshi_weather.engine.calibration import ForecastCalibrator
+from kalshi_weather.engine.position_manager import evaluate_open_positions
 from kalshi_weather.cli.display import Dashboard
 from kalshi_weather.utils.temperature_logs import DailyTemperatureLogger
 
@@ -133,6 +134,11 @@ class WeatherBot:
             upper_bound=adjusted.conditioning_ceiling_f,
         )
         model_probabilities = {bp.bracket.ticker: bp.model_prob for bp in bracket_probs}
+        open_positions = self.contract.fetch_open_positions()
+        position_recommendations = evaluate_open_positions(
+            positions=open_positions,
+            model_probabilities=model_probabilities,
+        )
 
         return MarketAnalysis(
             city=self.city_config.name,
@@ -151,6 +157,7 @@ class WeatherBot:
             tomorrow_date=tomorrow,
             tomorrow_forecast_mean=tomorrow_combined.mean_temp_f if tomorrow_combined else None,
             model_probabilities=model_probabilities,
+            open_positions=position_recommendations,
             trajectory_assessment=adjusted.trajectory_assessment,
         )
 

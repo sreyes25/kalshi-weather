@@ -18,7 +18,7 @@ from kalshi_weather.data.markets import (
     parse_market_to_bracket,
 )
 from kalshi_weather.core import BracketType, ContractType
-from kalshi_weather.config import KALSHI_MARKETS_URL, NYC
+from kalshi_weather.config import KALSHI_MARKETS_URL, KALSHI_API_BASE, NYC
 
 
 # =============================================================================
@@ -288,6 +288,58 @@ class TestKalshiMarketClient:
         responses.add(responses.GET, KALSHI_MARKETS_URL, json=make_api_response([]), status=200)
         client = KalshiMarketClient(NYC)
         assert client.series_ticker == NYC.high_temp_ticker
+
+    @responses.activate
+    def test_fetch_open_positions_parses_market_positions_with_position_fp(self, monkeypatch):
+        monkeypatch.setenv("KALSHI_API_KEY", "test-key")
+        monkeypatch.setenv(
+            "KALSHI_PRIVATE_KEY",
+            "-----BEGIN RSA PRIVATE KEY-----\\ninvalid\\n-----END RSA PRIVATE KEY-----",
+        )
+        client = KalshiMarketClient(NYC, ContractType.HIGH_TEMP)
+        client._get_signed_headers = lambda *_args, **_kwargs: {}
+        client._load_private_key = lambda: object()
+
+        positions_url = f"{KALSHI_API_BASE}/portfolio/positions"
+        detail_url = f"{KALSHI_API_BASE}/markets/{EVENT_TICKER}-B54"
+        responses.add(
+            responses.GET,
+            positions_url,
+            json={
+                "cursor": "",
+                "event_positions": [],
+                "market_positions": [
+                    {
+                        "ticker": f"{EVENT_TICKER}-B54",
+                        "position_fp": "10000",
+                        "total_traded_dollars": "5.50",
+                        "market_exposure_dollars": "5.50",
+                    }
+                ],
+            },
+            status=200,
+        )
+        responses.add(
+            responses.GET,
+            detail_url,
+            json={
+                "market": {
+                    "ticker": f"{EVENT_TICKER}-B54",
+                    "subtitle": "54° to 56°",
+                    "yes_bid": 57,
+                    "yes_ask": 59,
+                    "last_price": 58,
+                }
+            },
+            status=200,
+        )
+
+        rows = client.fetch_open_positions()
+        assert len(rows) == 1
+        assert rows[0]["ticker"] == f"{EVENT_TICKER}-B54"
+        assert rows[0]["contracts"] == 1
+        assert rows[0]["side"] == "YES"
+        assert rows[0]["average_entry_price_cents"] == 550
 
 
 # =============================================================================

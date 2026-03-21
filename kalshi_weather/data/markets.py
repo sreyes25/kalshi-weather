@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import time
+import base64
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import List, Dict, Optional, Tuple, Any
@@ -24,6 +25,14 @@ from kalshi_weather.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+try:
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+except Exception:  # pragma: no cover - optional dependency fallback
+    hashes = None
+    serialization = None
+    padding = None
 
 def _safe_price_cents(value: Optional[object], default: int) -> int:
     """
@@ -69,6 +78,24 @@ def _extract_probability(value: Optional[object]) -> Optional[float]:
     if prob > 1.0:
         prob /= 100.0
     return max(0.0, min(1.0, prob))
+
+
+def _fixed_point_to_float(value: Any) -> Optional[float]:
+    """
+    Best-effort parse for Kalshi *_fp fields.
+
+    Kalshi fixed-point fields are commonly scaled by 1e4.
+    """
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if abs(numeric) >= 1_000:
+        return numeric / 10_000.0
+    return numeric
 
 
 # Regex patterns for parsing bracket subtitles
@@ -197,8 +224,10 @@ class KalshiMarketClient(MarketDataSource):
         self._last_status: Optional[Dict] = None
         self.api_key = os.getenv("KALSHI_API_KEY", "") or os.getenv("KALSHI_API_KEY_ID", "")
         self.api_secret = os.getenv("KALSHI_API_SECRET", "")
+        self.private_key = os.getenv("KALSHI_PRIVATE_KEY", "") or self.api_secret
         self._auth_warning_logged = False
         self._debug_logged_tickers: set[str] = set()
+        self._signing_key = None
 
     def _get_series_ticker(self) -> str:
         """Get the series ticker based on city and contract type."""
@@ -217,14 +246,63 @@ class KalshiMarketClient(MarketDataSource):
         }
 
 
+    def _load_private_key(self):
+        if self._signing_key is not None:
+            return self._signing_key
+
+        if not self.private_key or serialization is None:
+            return None
+
+        key_text = self.private_key.replace("\\n", "\n").strip()
+        try:
+            self._signing_key = serialization.load_pem_private_key(
+                key_text.encode("utf-8"),
+                password=None,
+            )
+        except Exception as exc:
+            logger.warning("Failed to load Kalshi private key: %s", exc)
+            self._signing_key = None
+        return self._signing_key
+
     def _get_signed_headers(self, method: str, request_path: str) -> Dict:
         headers = self._get_headers().copy()
 
-        if not self.api_key or not self.api_secret:
+        if not self.api_key:
+            return headers
+        if not request_path.startswith("/"):
+            request_path = f"/{request_path}"
+
+        key = self._load_private_key()
+        if key is None or hashes is None or padding is None:
+            if not self._auth_warning_logged:
+                logger.warning(
+                    "Kalshi authenticated calls need a valid RSA private key and cryptography package."
+                )
+                self._auth_warning_logged = True
             return headers
 
-        logger.warning(
-            "Authenticated Kalshi requests are currently disabled in this client; using public market-data endpoints."
+        timestamp_ms = str(int(time.time() * 1000))
+        message = f"{timestamp_ms}{method.upper()}{request_path}".encode("utf-8")
+        try:
+            signature = key.sign(
+                message,
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.DIGEST_LENGTH,
+                ),
+                hashes.SHA256(),
+            )
+            signature_b64 = base64.b64encode(signature).decode("utf-8")
+        except Exception as exc:
+            logger.warning("Failed to sign Kalshi request: %s", exc)
+            return headers
+
+        headers.update(
+            {
+                "KALSHI-ACCESS-KEY": self.api_key,
+                "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
+                "KALSHI-ACCESS-SIGNATURE": signature_b64,
+            }
         )
         return headers
 
@@ -266,7 +344,6 @@ class KalshiMarketClient(MarketDataSource):
         /trade-api/v2/markets/{market_ticker}
         """
         try:
-            request_path = f"/trade-api/v2/markets/{market_ticker}"
             response = requests.get(
                 f"{KALSHI_API_BASE}/markets/{market_ticker}",
                 headers=self._get_headers(),
@@ -294,6 +371,182 @@ class KalshiMarketClient(MarketDataSource):
         except (ValueError, KeyError, TypeError) as e:
             logger.warning(f"Failed to parse market detail {market_ticker}: {e}")
             return None
+
+    def _extract_open_positions_payload(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        data = payload.get("data")
+        if isinstance(data, dict):
+            payload = data
+        for key in ("market_positions", "positions", "open_positions"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+        return []
+
+    def _pick_first(self, data: Dict[str, Any], keys: List[str]) -> Any:
+        for key in keys:
+            if key in data and data[key] is not None:
+                return data[key]
+        return None
+
+    def _to_cents(self, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        parsed = _safe_dollar_str_to_cents(value, -1)
+        if parsed >= 0:
+            return parsed
+        cents = _safe_price_cents(value, -1)
+        return cents if cents >= 0 else None
+
+    def _to_int(self, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_open_position(self, raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        market_ticker = str(
+            self._pick_first(raw, ["ticker", "market_ticker", "instrument_ticker"]) or ""
+        ).strip()
+        if not market_ticker:
+            return None
+
+        side_raw = str(self._pick_first(raw, ["side", "position_side", "direction"]) or "").upper()
+        quantity = self._to_int(
+            self._pick_first(raw, ["position", "quantity", "contracts", "open_contracts"])
+        )
+        position_fp = _fixed_point_to_float(raw.get("position_fp"))
+        if quantity is None and position_fp is not None:
+            quantity = int(round(position_fp))
+        yes_quantity = self._to_int(self._pick_first(raw, ["yes_position", "yes_contracts"]))
+        no_quantity = self._to_int(self._pick_first(raw, ["no_position", "no_contracts"]))
+        quantity = quantity if quantity is not None else 0
+
+        # If side missing, infer from signed quantity convention.
+        if side_raw not in {"YES", "NO"} and quantity != 0:
+            side_raw = "NO" if quantity < 0 else "YES"
+        if side_raw not in {"YES", "NO"}:
+            if (yes_quantity or 0) > 0:
+                side_raw = "YES"
+            elif (no_quantity or 0) > 0:
+                side_raw = "NO"
+
+        if side_raw == "YES":
+            contracts = (
+                abs(quantity)
+                if quantity != 0
+                else abs(yes_quantity or 0)
+            )
+        elif side_raw == "NO":
+            contracts = (
+                abs(quantity)
+                if quantity != 0
+                else abs(no_quantity or 0)
+            )
+        else:
+            contracts = abs(quantity) if quantity != 0 else max(abs(yes_quantity or 0), abs(no_quantity or 0))
+        if contracts == 0:
+            return None
+
+        avg_yes = self._to_cents(
+            self._pick_first(raw, ["average_yes_price", "avg_yes_price", "yes_average_price"])
+        )
+        avg_no = self._to_cents(
+            self._pick_first(raw, ["average_no_price", "avg_no_price", "no_average_price"])
+        )
+        average_entry = self._to_cents(
+            self._pick_first(
+                raw,
+                [
+                    "average_open_price",
+                    "avg_open_price",
+                    "average_price",
+                    "avg_price",
+                    "cost_basis",
+                    "entry_price",
+                ],
+            )
+        )
+        if average_entry is None:
+            if side_raw == "YES" and avg_yes is not None:
+                average_entry = avg_yes
+            elif side_raw == "NO" and avg_no is not None:
+                average_entry = avg_no
+        if average_entry is None and contracts > 0:
+            total_traded_cents = self._to_cents(raw.get("total_traded_dollars"))
+            exposure_cents = self._to_cents(raw.get("market_exposure_dollars"))
+            if total_traded_cents is not None and total_traded_cents > 0:
+                average_entry = int(round(total_traded_cents / contracts))
+            elif exposure_cents is not None and exposure_cents > 0:
+                average_entry = int(round(exposure_cents / contracts))
+
+        return {
+            "ticker": market_ticker,
+            "side": side_raw,
+            "contracts": contracts,
+            "average_entry_price_cents": average_entry,
+            "event_ticker": self._pick_first(raw, ["event_ticker"]),
+        }
+
+    def fetch_open_positions(self) -> List[Dict[str, Any]]:
+        """
+        Fetch account open positions and enrich with live quote fields.
+
+        Returns:
+            List of dicts with ticker/side/contracts/average_entry_price_cents and quote metadata.
+        """
+        if not self.api_key:
+            return []
+        if self._load_private_key() is None:
+            return []
+
+        request_path = "/trade-api/v2/portfolio/positions"
+        try:
+            response = requests.get(
+                f"{KALSHI_API_BASE}/portfolio/positions",
+                params={"status": "open", "limit": 200},
+                headers=self._get_signed_headers("GET", request_path),
+                timeout=API_TIMEOUT,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.exceptions.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else "unknown"
+            logger.warning("Failed to fetch open positions: HTTP %s", status_code)
+            return []
+        except requests.exceptions.RequestException as exc:
+            logger.warning("Failed to fetch open positions: %s", exc)
+            return []
+        except (ValueError, TypeError) as exc:
+            logger.warning("Failed to parse open positions response: %s", exc)
+            return []
+
+        parsed: List[Dict[str, Any]] = []
+        for raw_position in self._extract_open_positions_payload(payload):
+            if not isinstance(raw_position, dict):
+                continue
+            parsed_row = self._parse_open_position(raw_position)
+            if not parsed_row:
+                continue
+
+            detail = self._fetch_market_detail(parsed_row["ticker"]) or {}
+            parsed_row["subtitle"] = detail.get("subtitle")
+            parsed_row["event_ticker"] = parsed_row.get("event_ticker") or detail.get("event_ticker")
+            parsed_row["yes_bid"] = self._to_cents(detail.get("yes_bid_dollars"))
+            if parsed_row["yes_bid"] is None:
+                parsed_row["yes_bid"] = self._to_cents(detail.get("yes_bid", detail.get("bid")))
+            parsed_row["yes_ask"] = self._to_cents(detail.get("yes_ask_dollars"))
+            if parsed_row["yes_ask"] is None:
+                parsed_row["yes_ask"] = self._to_cents(detail.get("yes_ask", detail.get("ask")))
+            parsed_row["last_price"] = self._to_cents(detail.get("last_price_dollars"))
+            if parsed_row["last_price"] is None:
+                parsed_row["last_price"] = self._to_cents(detail.get("last_price"))
+            if parsed_row.get("average_entry_price_cents") is None:
+                parsed_row["average_entry_price_cents"] = parsed_row.get("last_price")
+            parsed.append(parsed_row)
+
+        return parsed
 
     def fetch_brackets(self, target_date: str) -> List[MarketBracket]:
         """Fetch all brackets for a target date's temperature market."""
@@ -441,13 +694,15 @@ def get_market_summary(
 def get_kalshi_auth_debug_info() -> Dict[str, Any]:
     """Return safe debug info for troubleshooting local Kalshi setup."""
     api_secret = os.getenv("KALSHI_API_SECRET", "")
+    private_key = os.getenv("KALSHI_PRIVATE_KEY", "") or api_secret
     api_key = os.getenv("KALSHI_API_KEY", "") or os.getenv("KALSHI_API_KEY_ID", "")
 
     return {
         "has_api_key": bool(api_key),
         "api_key_prefix": api_key[:8] if api_key else "",
         "has_api_secret": bool(api_secret),
-        "using_public_market_data": True,
+        "has_private_key": bool(private_key),
+        "authenticated_requests_enabled": bool(api_key and private_key and serialization is not None),
         "api_base": KALSHI_API_BASE,
         "markets_url": KALSHI_MARKETS_URL,
     }

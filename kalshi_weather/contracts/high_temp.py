@@ -8,6 +8,7 @@ from kalshi_weather.core import (
     TemperatureForecast,
     DailyObservation,
     MarketBracket,
+    OpenPosition,
 )
 from kalshi_weather.config import CityConfig, DEFAULT_CITY
 from kalshi_weather.data import (
@@ -89,3 +90,22 @@ class HighTempContract(BaseContract):
     def get_available_dates(self) -> List[str]:
         """Get list of dates with open markets."""
         return self._market_client.get_available_dates()
+
+    def fetch_open_positions(self) -> List[OpenPosition]:
+        """Fetch current account open positions (if authenticated)."""
+        positions: List[OpenPosition] = []
+        for row in self._market_client.fetch_open_positions():
+            positions.append(
+                OpenPosition(
+                    ticker=row["ticker"],
+                    side=row["side"],
+                    contracts=row["contracts"],
+                    average_entry_price_cents=row["average_entry_price_cents"],
+                    event_ticker=row.get("event_ticker"),
+                    subtitle=row.get("subtitle"),
+                    yes_bid=row.get("yes_bid"),
+                    yes_ask=row.get("yes_ask"),
+                    last_price=row.get("last_price"),
+                )
+            )
+        return positions

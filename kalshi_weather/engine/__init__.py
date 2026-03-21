@@ -26,6 +26,7 @@ from kalshi_weather.engine.probability import (
     normal_cdf,
 )
 from kalshi_weather.engine.trajectory import TrajectoryEngine
+from kalshi_weather.engine.position_manager import evaluate_open_positions
 
 __all__ = [
     # Module 2A
@@ -47,4 +48,5 @@ __all__ = [
     "calculate_bracket_probabilities",
     "normal_cdf",
     "TrajectoryEngine",
+    "evaluate_open_positions",
 ]

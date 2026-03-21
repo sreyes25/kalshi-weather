@@ -15,7 +15,12 @@ from rich.text import Text
 from rich.align import Align
 from rich import box
 
-from kalshi_weather.core.models import MarketAnalysis, TradingSignal, MarketBracket
+from kalshi_weather.core.models import (
+    MarketAnalysis,
+    TradingSignal,
+    MarketBracket,
+    PositionRecommendation,
+)
 
 class Dashboard:
     """
@@ -49,6 +54,7 @@ class Dashboard:
         self.layout["right"].split(
             Layout(name="brackets", ratio=1),
             Layout(name="signals", ratio=1),
+            Layout(name="positions", ratio=1),
         )
 
     def generate_header(self, analysis: Optional[MarketAnalysis] = None) -> Panel:
@@ -330,6 +336,64 @@ class Dashboard:
             
         return Panel(table, title=f"Signals ({len(analysis.signals)})", border_style="magenta")
 
+    def _format_position_price(self, cents: Optional[int]) -> str:
+        return f"{cents}c" if cents is not None else "-"
+
+    def _format_position_action(self, rec: PositionRecommendation) -> str:
+        mapping = {
+            "SELL_NOW": "[bold red]SELL NOW[/bold red]",
+            "HOLD": "[bold green]HOLD[/bold green]",
+            "HOLD_FOR_TARGET": "[bold yellow]WAIT[/bold yellow]",
+            "NO_MODEL": "[dim]NO MODEL[/dim]",
+            "NO_QUOTE": "[dim]NO QUOTE[/dim]",
+        }
+        return mapping.get(rec.action, rec.action)
+
+    def generate_positions_panel(self, analysis: MarketAnalysis) -> Panel:
+        """Create open positions panel with deterministic sell guidance."""
+        if not analysis.open_positions:
+            return Panel(
+                Align.center("[dim]No open positions found (or auth unavailable)[/dim]"),
+                title="Open Positions",
+                border_style="white",
+            )
+
+        table = Table(box=box.SIMPLE, expand=True)
+        table.add_column("Market")
+        table.add_column("Side", justify="center")
+        table.add_column("Qty", justify="right")
+        table.add_column("Entry", justify="right")
+        table.add_column("Now", justify="right")
+        table.add_column("Model", justify="right")
+        table.add_column("Target", justify="right")
+        table.add_column("Action", justify="center")
+
+        for rec in analysis.open_positions:
+            market_label = rec.position.subtitle or rec.position.ticker
+            now_px = self._format_position_price(rec.liquidation_price_cents)
+            model_fair = (
+                f"{rec.fair_value_cents:.1f}c" if rec.fair_value_cents is not None else "-"
+            )
+            target = self._format_position_price(rec.target_exit_price_cents)
+            table.add_row(
+                market_label,
+                rec.position.side,
+                str(rec.position.contracts),
+                self._format_position_price(rec.position.average_entry_price_cents),
+                now_px,
+                model_fair,
+                target,
+                self._format_position_action(rec),
+            )
+
+        notes = []
+        for rec in analysis.open_positions[:2]:
+            if rec.rationale:
+                notes.append(f"• {rec.position.ticker}: {rec.rationale}")
+
+        body = Group(table, Text("\n".join(notes), style="dim")) if notes else table
+        return Panel(body, title="Open Positions", border_style="bright_cyan")
+
     def update(self, analysis: MarketAnalysis):
         """Update the dashboard with new analysis."""
         
@@ -339,6 +403,7 @@ class Dashboard:
         self.layout["observations"].update(self.generate_observation_panel(analysis))
         self.layout["brackets"].update(self.generate_bracket_table(analysis))
         self.layout["signals"].update(self.generate_signals_panel(analysis))
+        self.layout["positions"].update(self.generate_positions_panel(analysis))
         
         # Simple footer
         status_text = "Advisory only (no auto-trading). Running... Press Ctrl+C to exit."

@@ -11,6 +11,8 @@ from kalshi_weather.core.models import (
     DailyObservation,
     MarketBracket,
     TradingSignal,
+    OpenPosition,
+    PositionRecommendation,
     TrajectoryAssessment,
     MarketAnalysis,
     # Abstract interfaces
@@ -29,6 +31,8 @@ __all__ = [
     "DailyObservation",
     "MarketBracket",
     "TradingSignal",
+    "OpenPosition",
+    "PositionRecommendation",
     "TrajectoryAssessment",
     "MarketAnalysis",
     "WeatherModelSource",
