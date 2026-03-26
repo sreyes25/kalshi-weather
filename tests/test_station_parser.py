@@ -175,6 +175,21 @@ class TestParseObservation:
         assert reading.possible_actual_f_low < reading.reported_temp_f
         assert reading.possible_actual_f_high > reading.reported_temp_f
 
+    def test_parse_includes_wind_fields(self):
+        obs = {
+            "type": "Feature",
+            "properties": {
+                "timestamp": "2026-01-20T15:00:00+00:00",
+                "temperature": {"value": 12.5, "unitCode": "wmoUnit:degC"},
+                "windDirection": {"value": 250.0, "unitCode": "wmoUnit:degree_(angle)"},
+                "windSpeed": {"value": 5.0, "unitCode": "wmoUnit:m_s-1"},
+            },
+        }
+        reading = parse_observation(obs, StationType.HOURLY, STATION_ID)
+        assert reading is not None
+        assert reading.wind_direction_deg == 250.0
+        assert abs((reading.wind_speed_mph or 0.0) - 11.2) < 0.2
+
 
 # =============================================================================
 # NWS STATION PARSER TESTS

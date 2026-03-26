@@ -14,6 +14,8 @@ from kalshi_weather.core.models import (
     OpenPosition,
     PositionRecommendation,
     TrajectoryAssessment,
+    PeakPrediction,
+    TradeDecisionSnapshot,
     MarketAnalysis,
     # Abstract interfaces
     WeatherModelSource,
@@ -34,6 +36,8 @@ __all__ = [
     "OpenPosition",
     "PositionRecommendation",
     "TrajectoryAssessment",
+    "PeakPrediction",
+    "TradeDecisionSnapshot",
     "MarketAnalysis",
     "WeatherModelSource",
     "StationDataSource",

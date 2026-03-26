@@ -65,6 +65,7 @@ python -m kalshi_weather view-graph --city NYC --once
 |---------|-------------|
 | `run` | Launch the interactive trading dashboard |
 | `view-graph` | View live intraday line graph from daily CSV logs |
+| `backtest` | Replay historical logs and report prediction/trade metrics |
 | `status` | Check market status and available dates |
 | `brackets` | Display current market brackets and prices |
 | `forecasts` | Show weather forecasts from all sources |
@@ -102,6 +103,21 @@ kalshi-weather dsm --date 2026-02-02
 kalshi-weather dsm --date 2026-02-02 --all
 ```
 
+### Backtest Command
+
+Replay local hourly progression logs and summarize strategy quality metrics:
+
+```bash
+# One-week simulation with $20 bankroll
+kalshi-weather backtest --city NYC --days 7 --starting-balance 20
+```
+
+The backtest reports:
+- final-high prediction accuracy
+- average lead time before lock-in prediction
+- trade win rate
+- ROI
+
 ## Documentation
 
 *   [Usage & Signals Guide](docs/usage_guide.md) - How to read the dashboard and trade.
@@ -112,6 +128,47 @@ kalshi-weather dsm --date 2026-02-02 --all
 Check `.env` to tweak settings like:
 *   `MIN_EDGE_THRESHOLD` (Default: 8%)
 *   `DEFAULT_CITY` (Default: NYC)
+
+### Alerts (Manual Action Notifications)
+
+You can keep the bot running and receive alerts when:
+- an open position drawdown crosses your threshold (for example `35%` or `25%`)
+- the model's primary bracket changes (with a today/tomorrow summary)
+- an additional LLM-ready prompt message is generated after bracket shifts
+
+Set these in `.env`:
+
+```bash
+# Enable outbound alerts
+ALERTS_ENABLED=true
+# Provider: twilio | whatsapp_cloud
+ALERTS_PROVIDER=whatsapp_cloud
+
+# Position risk threshold (0.35 = 35% loss from entry-side price)
+ALERT_POSITION_LOSS_FRACTION=0.35
+
+# Bracket-change updates
+ALERT_BRACKET_CHANGE_ENABLED=true
+ALERT_LLM_PROMPT_ENABLED=true
+ALERT_TOP_BRACKETS=3
+
+# Common destination override (optional)
+ALERT_TO_NUMBER=+1YYYYYYYYYY
+
+# WhatsApp Cloud (Meta) credentials
+WHATSAPP_PHONE_NUMBER_ID=...
+WHATSAPP_ACCESS_TOKEN=...
+WHATSAPP_TO_NUMBER=+1YYYYYYYYYY
+
+# Twilio credentials + routing (if ALERTS_PROVIDER=twilio)
+TWILIO_ACCOUNT_SID=...
+TWILIO_AUTH_TOKEN=...
+TWILIO_FROM_NUMBER=+1XXXXXXXXXX
+```
+
+Notes:
+- If you prefer a `25%` alert instead of `35%`, set `ALERT_POSITION_LOSS_FRACTION=0.25`.
+- If `ALERT_TO_NUMBER` is omitted, fallback is `WHATSAPP_TO_NUMBER` then `REMOTE_KILL_ALLOWED_FROM`.
 
 ## License
 

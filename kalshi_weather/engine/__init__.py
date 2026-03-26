@@ -28,6 +28,7 @@ from kalshi_weather.engine.probability import (
 from kalshi_weather.engine.trajectory import TrajectoryEngine
 from kalshi_weather.engine.position_manager import evaluate_open_positions
 from kalshi_weather.engine.auto_trader import execute_auto_sells
+from kalshi_weather.engine.decision_engine import DecisionEngine
 
 __all__ = [
     # Module 2A
@@ -51,4 +52,5 @@ __all__ = [
     "TrajectoryEngine",
     "evaluate_open_positions",
     "execute_auto_sells",
+    "DecisionEngine",
 ]

@@ -5,6 +5,11 @@ from datetime import datetime, timedelta
 
 from kalshi_weather import __version__, get_city, list_cities
 from kalshi_weather.contracts import HighTempContract
+from kalshi_weather.config.settings import (
+    MIN_CONFIDENCE_THRESHOLD,
+    MIN_EDGE_THRESHOLD,
+    MAX_TRADES_PER_DAY,
+)
 from kalshi_weather.utils import setup_logging
 
 
@@ -218,6 +223,61 @@ def settlement(city: str, date: str, days: int):
         click.echo(f"Low Temp:        {record.settlement_low_f:.0f}°F")
         click.echo(f"Source:          {record.source}")
         click.echo(f"Station:         {record.station_name}")
+
+
+@main.command()
+@click.option("--city", "-c", default="NYC", help="City code (NYC, CHI, LAX, MIA, AUS)")
+@click.option("--days", "-n", default=7, type=int, help="Backtest window in days from local logs")
+@click.option("--base-size", default=1.0, type=float, help="Synthetic base position size per trade")
+@click.option("--starting-balance", default=20.0, type=float, help="Simulated starting bankroll in dollars")
+def backtest(city: str, days: int, base_size: float, starting_balance: float):
+    """Run historical replay backtest from local hourly progression logs."""
+    from kalshi_weather.engine.backtesting import BacktestingEngine
+
+    try:
+        city_config = get_city(city)
+    except KeyError as e:
+        click.echo(f"Error: {e}", err=True)
+        return
+
+    engine = BacktestingEngine(city=city_config)
+    summary = engine.run(
+        days=max(1, days),
+        min_confidence_threshold=MIN_CONFIDENCE_THRESHOLD,
+        min_edge_threshold=MIN_EDGE_THRESHOLD,
+        max_trades_per_day=MAX_TRADES_PER_DAY,
+        base_size=max(0.1, float(base_size)),
+        starting_balance_dollars=max(0.01, float(starting_balance)),
+    )
+
+    click.echo(f"\n{'='*64}")
+    click.echo(f"Backtest Summary: {city_config.name}")
+    click.echo(f"{'='*64}")
+    click.echo(f"Days requested:                   {summary.days_requested}")
+    click.echo(f"Days tested:                      {summary.days_tested}")
+    click.echo(f"Prediction accuracy (final high): {summary.prediction_accuracy:.1%}")
+    click.echo(f"Avg peak prediction lead:         {summary.avg_peak_prediction_lead_hours:.2f}h")
+    click.echo(f"Trades:                           {summary.total_trades}")
+    click.echo(f"Win rate:                         {summary.win_rate:.1%}")
+    click.echo(f"Total PnL:                        ${summary.total_pnl_dollars:+.2f}")
+    click.echo(f"ROI:                              {summary.roi:.1%}")
+    click.echo(f"Starting balance:                 ${summary.starting_balance_dollars:.2f}")
+    click.echo(f"Ending balance:                   ${summary.ending_balance_dollars:.2f}")
+    click.echo(f"Net return:                       {summary.return_pct:+.1%}")
+    if summary.synthetic_market_model:
+        click.echo("Pricing model:                    synthetic lagged market approximation")
+    if summary.proxy_settlement_days > 0:
+        click.echo(f"Settlement fallback days:         {summary.proxy_settlement_days} (proxy observed-high)")
+
+    if summary.day_results:
+        click.echo(f"\n{'Date':<12} {'Settle':>8} {'Pred':>8} {'Lead(h)':>8} {'Trades':>8} {'PnL($)':>10}")
+        click.echo("-" * 64)
+        for day in summary.day_results[-10:]:
+            lead = "-" if day.lead_time_hours is None else f"{day.lead_time_hours:.2f}"
+            click.echo(
+                f"{day.date:<12} {day.settlement_high_f:>7.1f}° {day.final_predicted_high_f:>7.0f}° "
+                f"{lead:>8} {len(day.trades):>8} {day.pnl_dollars:>+10.2f}"
+            )
 
 
 @main.command()

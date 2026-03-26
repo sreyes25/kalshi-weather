@@ -219,6 +219,8 @@ class DSMParser:
             observed_high_f=max_temp,
             possible_actual_high_low=max_temp,
             possible_actual_high_high=max_temp,
+            reported_series_high_f=max_temp,
+            reported_max_6h_f=None,
             readings=[],
             last_updated=datetime.now(ZoneInfo(self.city.timezone)),
         )
@@ -228,4 +230,3 @@ def get_dsm_observation(city: CityConfig = None) -> Optional[DailyObservation]:
     """Convenience function to fetch DSM observation."""
     parser = DSMParser(city)
     return parser.fetch_dsm()
-

@@ -5,7 +5,7 @@ Add new cities here to extend support.
 """
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Tuple
 
 
 @dataclass(frozen=True)
@@ -22,6 +22,7 @@ class CityConfig:
     low_temp_ticker: str = ""    # e.g., "KXLOWNY"
     # NWS Weather Forecast Office for climate reports
     wfo: str = ""                # e.g., "okx" for NYC
+    nearby_station_ids: Tuple[str, ...] = ()  # Supplemental live stations for nowcast confirmation
 
 
 # =============================================================================
@@ -38,6 +39,7 @@ NYC = CityConfig(
     high_temp_ticker="KXHIGHNY",
     low_temp_ticker="KXLOWNY",
     wfo="okx",
+    nearby_station_ids=("KJFK", "KLGA", "KEWR"),
 )
 
 # =============================================================================

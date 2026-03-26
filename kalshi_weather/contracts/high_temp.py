@@ -138,3 +138,44 @@ class HighTempContract(BaseContract):
             side=side,
             price_cents=price_cents,
         )
+
+    def place_entry_buy_limit(
+        self,
+        ticker: str,
+        side: str,
+        count: int,
+        limit_price_cents: int,
+        client_order_id: str,
+        prefer_resting: bool = False,
+    ) -> tuple[bool, str]:
+        """Place a limit buy order for opening/adding position."""
+        return self._market_client.place_entry_buy_limit(
+            ticker=ticker,
+            side=side,
+            count=count,
+            limit_price_cents=limit_price_cents,
+            client_order_id=client_order_id,
+            prefer_resting=prefer_resting,
+        )
+
+    def has_resting_entry_like_order(self, ticker: str, side: str, price_cents: int) -> bool:
+        """Check whether a matching resting entry buy order already exists."""
+        return self._market_client.has_resting_entry_like_order(
+            ticker=ticker,
+            side=side,
+            price_cents=price_cents,
+        )
+
+    def cancel_resting_entry_orders(
+        self,
+        *,
+        client_order_prefix: str | None = None,
+        ticker: str | None = None,
+        max_orders: int = 20,
+    ) -> tuple[int, str]:
+        """Cancel resting non-reduce BUY orders (optionally filtered by client_order_id prefix)."""
+        return self._market_client.cancel_resting_entry_orders(
+            client_order_prefix=client_order_prefix,
+            ticker=ticker,
+            max_orders=max_orders,
+        )

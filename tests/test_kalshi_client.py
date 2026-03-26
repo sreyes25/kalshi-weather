@@ -93,7 +93,9 @@ class TestParseBracketSubtitle:
     def test_parse_greater_than_or_above(self):
         bracket_type, lower, upper = parse_bracket_subtitle("24° or above")
         assert bracket_type == BracketType.GREATER_THAN
-        assert lower == 24.0
+        # Internal GREATER_THAN semantics are strict (> lower_bound), so
+        # inclusive "or above" brackets are represented as > (X - 1).
+        assert lower == 23.0
         assert upper is None
 
     def test_parse_less_than_below(self):
@@ -118,7 +120,9 @@ class TestParseBracketSubtitle:
         bracket_type, lower, upper = parse_bracket_subtitle("15° or below")
         assert bracket_type == BracketType.LESS_THAN
         assert lower is None
-        assert upper == 15.0
+        # Internal LESS_THAN semantics are strict (< upper_bound), so
+        # inclusive "or below" brackets are represented as < (X + 1).
+        assert upper == 16.0
 
     def test_parse_invalid_subtitle_raises(self):
         with pytest.raises(ValueError):

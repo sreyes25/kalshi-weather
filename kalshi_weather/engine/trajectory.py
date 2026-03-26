@@ -85,29 +85,29 @@ class TrajectoryEngine:
             base_lock = 0.15
             time_upside_mult = 1.0
         elif hour < 16.0:
-            base_lock = 0.45
+            base_lock = 0.40
             time_upside_mult = 0.75
         elif hour < 18.0:
-            base_lock = 0.72
+            base_lock = 0.68
             time_upside_mult = 0.45
         else:
-            base_lock = 0.86
+            base_lock = 0.84
             time_upside_mult = 0.20
 
         trend_lock_boost = 0.0
         trend_upside_mult = 1.0
         if trend_f_per_hour <= -0.6:
-            trend_lock_boost = 0.22
-            trend_upside_mult = 0.30
+            trend_lock_boost = 0.18
+            trend_upside_mult = 0.35
         elif trend_f_per_hour <= -0.2:
-            trend_lock_boost = 0.14
+            trend_lock_boost = 0.12
             trend_upside_mult = 0.50
         elif trend_f_per_hour < 0.2:
             trend_lock_boost = 0.05
             trend_upside_mult = 0.75
         elif trend_f_per_hour >= 0.6:
-            trend_lock_boost = -0.12
-            trend_upside_mult = 1.40
+            trend_lock_boost = -0.10
+            trend_upside_mult = 1.30
         elif trend_f_per_hour >= 0.2:
             trend_lock_boost = -0.06
             trend_upside_mult = 1.20
@@ -137,7 +137,7 @@ class TrajectoryEngine:
             floor = 0.08 if hour < 18.0 else 0.04
             prob_exceed = max(prob_exceed, floor)
 
-        prob_exceed = _clamp(prob_exceed, 0.001, 0.95)
+        prob_exceed = _clamp(prob_exceed, 0.002, 0.95)
 
         lock_confidence = _clamp(base_lock + trend_lock_boost + gap_lock_boost, 0.02, 0.99)
         prob_high_already_set = _clamp(

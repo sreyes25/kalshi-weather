@@ -101,8 +101,18 @@ def _fixed_point_to_float(value: Any) -> Optional[float]:
 def _to_float_value(value: Any) -> Optional[float]:
     if value is None:
         return None
-    try:
+    if isinstance(value, (int, float)):
         return float(value)
+    try:
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.startswith("$"):
+            text = text[1:]
+        text = text.replace(",", "")
+        if text.endswith("%"):
+            text = text[:-1]
+        return float(text)
     except (TypeError, ValueError):
         return None
 
@@ -113,6 +123,10 @@ def _to_bool(value: Any) -> bool:
     if value is None:
         return False
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _is_transient_http_status(status_code: int) -> bool:
+    return status_code in {429, 500, 502, 503, 504}
 
 
 # Regex patterns for parsing bracket subtitles
@@ -140,14 +154,23 @@ def parse_bracket_subtitle(subtitle: str) -> Tuple[BracketType, Optional[float],
         upper = float(match.group(2))
         return (BracketType.BETWEEN, lower, upper)
 
+    s = subtitle.strip().lower()
     match = GREATER_THAN_PATTERN.search(subtitle)
     if match:
         threshold = float(match.group(1) or match.group(2))
+        # Internal GREATER_THAN logic is strict (> threshold).
+        # Market copy "X or above" is inclusive (>= X), so convert to > (X-1).
+        if "or above" in s:
+            return (BracketType.GREATER_THAN, threshold - 1.0, None)
         return (BracketType.GREATER_THAN, threshold, None)
 
     match = LESS_THAN_PATTERN.search(subtitle)
     if match:
         threshold = float(match.group(1) or match.group(2))
+        # Internal LESS_THAN logic is strict (< threshold).
+        # Market copy "X or below" is inclusive (<= X), so convert to < (X+1).
+        if "or below" in s:
+            return (BracketType.LESS_THAN, None, threshold + 1.0)
         return (BracketType.LESS_THAN, None, threshold)
 
     raise ValueError(f"Could not parse bracket subtitle: {subtitle}")
@@ -161,6 +184,25 @@ def calculate_implied_probability(yes_bid: int, yes_ask: int) -> float:
         return 1.0
     mid = (yes_bid + yes_ask) / 2.0
     return mid / 100.0
+
+
+def _derive_market_prob(
+    *,
+    yes_bid: int,
+    yes_ask: int,
+    last_price: int,
+) -> float:
+    """
+    Prefer live bid/ask midpoint for market probability.
+
+    Last trade can be stale during rapid repricing; midpoint is more robust for
+    real-time edge comparison. Falls back to last_price if quotes are invalid.
+    """
+    if 0 <= yes_bid <= 99 and 1 <= yes_ask <= 100 and yes_ask >= yes_bid:
+        return calculate_implied_probability(yes_bid, yes_ask)
+    if 0 <= last_price <= 100:
+        return max(0.0, min(1.0, last_price / 100.0))
+    return max(0.0, min(1.0, yes_bid / 100.0))
 
 
 def format_date_for_ticker(target_date: str) -> str:
@@ -196,11 +238,11 @@ def parse_market_to_bracket(market: Dict) -> Optional[MarketBracket]:
         except (TypeError, ValueError):
             volume = 0
 
-        implied_prob = _extract_probability(market.get("last_price_dollars"))
-        if implied_prob is None:
-            implied_prob = _extract_probability(market.get("last_price"))
-        if implied_prob is None:
-            implied_prob = max(0.0, min(1.0, yes_bid / 100.0))
+        implied_prob = _derive_market_prob(
+            yes_bid=yes_bid,
+            yes_ask=yes_ask,
+            last_price=last_price,
+        )
 
         return MarketBracket(
             ticker=ticker,
@@ -593,9 +635,6 @@ class KalshiMarketClient(MarketDataSource):
                 if isinstance(raw, dict):
                     rows.append(raw)
 
-        if not rows:
-            return {}
-
         realized = 0.0
         fees = 0.0
         traded = 0.0
@@ -605,8 +644,11 @@ class KalshiMarketClient(MarketDataSource):
 
         for row in rows:
             row_event = str(row.get("event_ticker") or "").strip()
-            if event_ticker and row_event and row_event != event_ticker:
-                continue
+            if event_ticker:
+                # Strict event scoping: when a specific event is requested,
+                # ignore rows that do not explicitly match it.
+                if not row_event or row_event != event_ticker:
+                    continue
             ticker = str(self._pick_first(row, ["ticker", "market_ticker", "instrument_ticker"]) or "")
             side = str(self._pick_first(row, ["side", "position_side", "direction"]) or "")
             signature = (
@@ -626,15 +668,186 @@ class KalshiMarketClient(MarketDataSource):
             exposure += _to_float_value(row.get("market_exposure_dollars")) or 0.0
 
         if matched_rows == 0:
-            return {}
-        return {
+            totals: Dict[str, float] = {}
+        else:
+            totals = {
             "realized_pnl_dollars": realized,
             "fees_paid_dollars": fees,
             "total_traded_dollars": traded,
             "market_exposure_dollars": exposure,
             "net_realized_after_fees_dollars": realized - fees,
             "markets_count": float(matched_rows),
-        }
+            }
+        totals.update(self.fetch_account_summary())
+        return totals
+
+    def fetch_account_summary(self) -> Dict[str, float]:
+        """
+        Best-effort account-level totals (cash/equity/buying power) from Kalshi.
+
+        Endpoint payload shapes vary by account/permission tier, so we probe a few
+        likely routes and normalize whatever fields are present.
+        """
+        if not self.api_key:
+            return {}
+        if self._load_private_key() is None:
+            return {}
+
+        endpoints = (
+            "/portfolio/balance",
+            "/portfolio/account",
+            "/portfolio/cash",
+            "/portfolio",
+            "/portfolio/summary",
+        )
+        for request_path in endpoints:
+            try:
+                response = requests.get(
+                    f"{KALSHI_API_BASE}{request_path}",
+                    headers=self._get_signed_headers("GET", f"/trade-api/v2{request_path}"),
+                    timeout=API_TIMEOUT,
+                )
+                response.raise_for_status()
+                payload = response.json()
+            except requests.exceptions.RequestException as exc:
+                logger.debug("Account summary endpoint failed %s: %s", request_path, exc)
+                continue
+            except (ValueError, TypeError):
+                continue
+
+            nodes: list[Dict[str, Any]] = []
+            stack: list[Any] = [payload]
+            seen_ids: set[int] = set()
+            while stack:
+                node = stack.pop()
+                node_id = id(node)
+                if node_id in seen_ids:
+                    continue
+                seen_ids.add(node_id)
+                if isinstance(node, dict):
+                    nodes.append(node)
+                    for value in node.values():
+                        if isinstance(value, (dict, list)):
+                            stack.append(value)
+                elif isinstance(node, list):
+                    for value in node:
+                        if isinstance(value, (dict, list)):
+                            stack.append(value)
+
+            if not nodes:
+                continue
+
+            out: Dict[str, float] = {}
+
+            def _extract_money(raw: Any, scale: str) -> Optional[float]:
+                if raw is None:
+                    return None
+                if isinstance(raw, dict):
+                    # Common nested money object forms: {"amount":"12.34"} / {"dollars":12.34}
+                    for key in ("amount", "dollars", "value", "usd", "cash", "balance"):
+                        if key in raw:
+                            nested = _extract_money(raw.get(key), "dollars")
+                            if nested is not None:
+                                return nested
+                    for key in ("fp", "fixed_point", "value_fp"):
+                        if key in raw:
+                            nested = _extract_money(raw.get(key), "fp")
+                            if nested is not None:
+                                return nested
+                    for key in ("cents", "value_cents"):
+                        if key in raw:
+                            nested = _extract_money(raw.get(key), "cents")
+                            if nested is not None:
+                                return nested
+                    return None
+                if scale == "fp":
+                    return _fixed_point_to_float(raw)
+                parsed = _to_float_value(raw)
+                if parsed is None:
+                    return None
+                if scale == "cents":
+                    return parsed / 100.0
+                return parsed
+
+            field_map: Dict[str, tuple[tuple[str, str], ...]] = {
+                "account_balance_dollars": (
+                    ("account_balance_dollars", "dollars"),
+                    ("balance_dollars", "dollars"),
+                    ("cash_balance_dollars", "dollars"),
+                    ("account_balance_fp", "fp"),
+                    ("balance_fp", "fp"),
+                    ("cash_balance_fp", "fp"),
+                    ("account_balance_cents", "cents"),
+                    ("balance_cents", "cents"),
+                    ("cash_balance_cents", "cents"),
+                    ("accountBalanceDollars", "dollars"),
+                    ("balanceDollars", "dollars"),
+                    ("cashBalanceDollars", "dollars"),
+                ),
+                "available_to_trade_dollars": (
+                    ("available_to_trade_dollars", "dollars"),
+                    ("available_balance_dollars", "dollars"),
+                    ("cash_available_dollars", "dollars"),
+                    ("available_to_trade_fp", "fp"),
+                    ("available_balance_fp", "fp"),
+                    ("cash_available_fp", "fp"),
+                    ("available_to_trade_cents", "cents"),
+                    ("available_balance_cents", "cents"),
+                    ("cash_available_cents", "cents"),
+                    ("availableToTradeDollars", "dollars"),
+                    ("availableBalanceDollars", "dollars"),
+                    ("cashAvailableDollars", "dollars"),
+                ),
+                "buying_power_dollars": (
+                    ("buying_power_dollars", "dollars"),
+                    ("available_buying_power_dollars", "dollars"),
+                    ("buying_power_fp", "fp"),
+                    ("available_buying_power_fp", "fp"),
+                    ("buying_power_cents", "cents"),
+                    ("available_buying_power_cents", "cents"),
+                    ("buyingPowerDollars", "dollars"),
+                    ("availableBuyingPowerDollars", "dollars"),
+                ),
+                "portfolio_value_dollars": (
+                    ("portfolio_value_dollars", "dollars"),
+                    ("account_value_dollars", "dollars"),
+                    ("equity_dollars", "dollars"),
+                    ("portfolio_value_fp", "fp"),
+                    ("account_value_fp", "fp"),
+                    ("equity_fp", "fp"),
+                    ("portfolio_value_cents", "cents"),
+                    ("account_value_cents", "cents"),
+                    ("equity_cents", "cents"),
+                    ("portfolioValueDollars", "dollars"),
+                    ("accountValueDollars", "dollars"),
+                    ("equityDollars", "dollars"),
+                ),
+            }
+            for target, aliases in field_map.items():
+                value = None
+                for node in nodes:
+                    for alias, scale in aliases:
+                        if alias not in node:
+                            continue
+                        value = _extract_money(node.get(alias), scale)
+                        if value is not None:
+                            break
+                    if value is not None:
+                        break
+                if value is not None:
+                    out[target] = value
+
+            # If buying power is absent but we do have available cash, use that as
+            # a safe lower-bound proxy for bankroll gating.
+            if (
+                out.get("buying_power_dollars") is None
+                and out.get("available_to_trade_dollars") is not None
+            ):
+                out["buying_power_dollars"] = float(out["available_to_trade_dollars"])
+
+            if out:
+                return out
+        return {}
 
     def fetch_resting_orders(self, ticker: Optional[str] = None) -> List[Dict[str, Any]]:
         """Fetch currently resting orders for dedupe checks."""
@@ -671,6 +884,116 @@ class KalshiMarketClient(MarketDataSource):
             if isinstance(rows, list):
                 return rows
         return []
+
+    def cancel_order(self, order_id: str) -> Tuple[bool, str]:
+        """Best-effort order cancel across known API variants."""
+        if not self.api_key:
+            return (False, "missing API key")
+        if self._load_private_key() is None:
+            return (False, "missing/invalid private key")
+        order_id = str(order_id).strip()
+        if not order_id:
+            return (False, "missing order_id")
+
+        endpoint_variants: List[Tuple[str, str, str, Optional[Dict[str, Any]]]] = [
+            ("DELETE", f"/portfolio/orders/{order_id}", f"/trade-api/v2/portfolio/orders/{order_id}", None),
+            ("POST", f"/portfolio/orders/{order_id}/cancel", f"/trade-api/v2/portfolio/orders/{order_id}/cancel", {}),
+            ("DELETE", f"/portfolio/orders/{order_id}/cancel", f"/trade-api/v2/portfolio/orders/{order_id}/cancel", None),
+            ("POST", "/portfolio/orders/cancel", "/trade-api/v2/portfolio/orders/cancel", {"order_id": order_id}),
+            ("POST", "/portfolio/orders/cancel", "/trade-api/v2/portfolio/orders/cancel", {"id": order_id}),
+        ]
+
+        last_error = "unknown cancel error"
+        for method, url_path, request_path, payload in endpoint_variants:
+            transient_retries = 2
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    if method == "DELETE":
+                        response = requests.delete(
+                            f"{KALSHI_API_BASE}{url_path}",
+                            headers=self._get_signed_headers("DELETE", request_path),
+                            timeout=API_TIMEOUT,
+                        )
+                    else:
+                        response = requests.post(
+                            f"{KALSHI_API_BASE}{url_path}",
+                            json=payload,
+                            headers=self._get_signed_headers("POST", request_path),
+                            timeout=API_TIMEOUT,
+                        )
+                    if response.status_code in {200, 201, 202, 204, 409}:
+                        return (True, f"ok ({method} {url_path})")
+                    body = response.text[:300]
+                    last_error = f"{method} {url_path} -> HTTP {response.status_code}: {body}"
+                    if _is_transient_http_status(response.status_code) and attempt <= transient_retries:
+                        time.sleep(0.25 * attempt)
+                        continue
+                except requests.exceptions.RequestException as exc:
+                    last_error = f"{method} {url_path} -> {exc}"
+                    if attempt <= transient_retries:
+                        time.sleep(0.25 * attempt)
+                        continue
+                break
+        return (False, last_error)
+
+    def cancel_resting_entry_orders(
+        self,
+        *,
+        client_order_prefix: Optional[str] = None,
+        ticker: Optional[str] = None,
+        max_orders: int = 20,
+    ) -> Tuple[int, str]:
+        """
+        Cancel resting non-reduce BUY orders, optionally filtered by client_order_id prefix.
+        Returns (cancel_count, detail_message).
+        """
+        orders = self.fetch_resting_orders(ticker=ticker)
+        if not orders:
+            return (0, "no resting orders")
+
+        candidates: List[Tuple[str, str]] = []
+        for order in orders:
+            try:
+                action = str(order.get("action", "")).strip().lower()
+                if action != "buy":
+                    continue
+                if _to_bool(order.get("reduce_only", False)):
+                    continue
+                client_order_id = str(order.get("client_order_id", "") or "").strip()
+                if client_order_prefix and not client_order_id.startswith(client_order_prefix):
+                    continue
+                order_id = (
+                    order.get("order_id")
+                    or order.get("id")
+                    or order.get("orderId")
+                    or order.get("orderID")
+                )
+                if order_id is None:
+                    continue
+                candidates.append((str(order_id), client_order_id))
+            except Exception:
+                continue
+
+        if not candidates:
+            return (0, "no matching resting entry BUY orders")
+
+        canceled = 0
+        errors: List[str] = []
+        for order_id, _client_order_id in candidates[: max(1, int(max_orders))]:
+            ok, reason = self.cancel_order(order_id)
+            if ok:
+                canceled += 1
+            else:
+                errors.append(f"{order_id}: {reason}")
+
+        if not errors:
+            return (canceled, "ok")
+        detail = "; ".join(errors[:2])
+        if len(errors) > 2:
+            detail += f"; +{len(errors) - 2} more errors"
+        return (canceled, detail)
 
     def place_reduce_only_sell_limit(
         self,
@@ -729,42 +1052,156 @@ class KalshiMarketClient(MarketDataSource):
 
         last_error = "unknown order error"
         for variant_name, payload in payload_variants:
-            try:
-                response = requests.post(
-                    f"{KALSHI_API_BASE}/portfolio/orders",
-                    json=payload,
-                    headers=self._get_signed_headers("POST", request_path),
-                    timeout=API_TIMEOUT,
-                )
-                if response.status_code == 409:
-                    # Usually means duplicate client_order_id.
-                    logger.info("Order skipped (duplicate client_order_id): %s", client_order_id)
-                    return (True, "duplicate client_order_id (already placed)")
-                if response.status_code >= 400:
-                    body = response.text[:400]
-                    last_error = f"{variant_name} -> HTTP {response.status_code}: {body}"
-                    # Retry across variants on known schema/value order-validation mismatches.
-                    if response.status_code == 400 and (
-                        ("TimeInForce" in body and "oneof" in body)
-                        or ("reduce_only can only be used with IoC orders" in body)
-                        or ("invalid_parameters" in body)
-                        or ("invalid_order" in body)
-                    ):
+            transient_retries = 2
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    response = requests.post(
+                        f"{KALSHI_API_BASE}/portfolio/orders",
+                        json=payload,
+                        headers=self._get_signed_headers("POST", request_path),
+                        timeout=API_TIMEOUT,
+                    )
+                    if response.status_code == 409:
+                        # Usually means duplicate client_order_id.
+                        logger.info("Order skipped (duplicate client_order_id): %s", client_order_id)
+                        return (True, "duplicate client_order_id (already placed)")
+                    if response.status_code >= 400:
+                        body = response.text[:400]
+                        last_error = f"{variant_name} -> HTTP {response.status_code}: {body}"
+                        if _is_transient_http_status(response.status_code) and attempt <= transient_retries:
+                            time.sleep(0.35 * attempt)
+                            continue
+                        # Retry across variants on known schema/value order-validation mismatches.
+                        if response.status_code == 400 and (
+                            ("TimeInForce" in body and "oneof" in body)
+                            or ("reduce_only can only be used with IoC orders" in body)
+                            or ("invalid_parameters" in body)
+                            or ("invalid_order" in body)
+                        ):
+                            continue
+                    response.raise_for_status()
+                    return (True, f"ok ({variant_name})")
+                except requests.exceptions.HTTPError as exc:
+                    status = exc.response.status_code if exc.response is not None else "unknown"
+                    body = exc.response.text[:400] if exc.response is not None else ""
+                    last_error = f"{variant_name} -> HTTP {status}: {body}"
+                    if isinstance(status, int) and _is_transient_http_status(status) and attempt <= transient_retries:
+                        time.sleep(0.35 * attempt)
                         continue
-                response.raise_for_status()
-                return (True, f"ok ({variant_name})")
-            except requests.exceptions.HTTPError as exc:
-                status = exc.response.status_code if exc.response is not None else "unknown"
-                body = exc.response.text[:400] if exc.response is not None else ""
-                last_error = f"{variant_name} -> HTTP {status}: {body}"
-                if status == 400:
-                    # Keep probing alternate payload shapes for 400 validation errors.
-                    continue
-                logger.warning("Failed to place order (%s): %s", ticker, last_error)
+                    if status == 400:
+                        # Keep probing alternate payload shapes for 400 validation errors.
+                        continue
+                    logger.warning("Failed to place order (%s): %s", ticker, last_error)
+                    break
+                except requests.exceptions.RequestException as exc:
+                    last_error = f"{variant_name} -> {exc}"
+                    if attempt <= transient_retries:
+                        time.sleep(0.35 * attempt)
+                        continue
+                    logger.warning("Failed to place order (%s): %s", ticker, exc)
+                    break
                 break
-            except requests.exceptions.RequestException as exc:
-                last_error = f"{variant_name} -> {exc}"
-                logger.warning("Failed to place order (%s): %s", ticker, exc)
+
+        return (False, last_error)
+
+    def place_entry_buy_limit(
+        self,
+        ticker: str,
+        side: str,
+        count: int,
+        limit_price_cents: int,
+        client_order_id: str,
+        prefer_resting: bool = False,
+    ) -> Tuple[bool, str]:
+        """Place a limit buy order for entry (non-reduce-only)."""
+        if not self.api_key:
+            return (False, "missing API key")
+        if self._load_private_key() is None:
+            return (False, "missing/invalid private key")
+        side_l = side.lower()
+        if side_l not in {"yes", "no"}:
+            return (False, f"invalid side: {side}")
+        if count <= 0:
+            return (False, "count must be > 0")
+        limit_price_cents = max(1, min(99, int(limit_price_cents)))
+
+        request_path = "/trade-api/v2/portfolio/orders"
+        base_payload: Dict[str, Any] = {
+            "ticker": ticker,
+            "action": "buy",
+            "side": side_l,
+            "type": "limit",
+            "count": int(count),
+            "client_order_id": client_order_id,
+        }
+        if side_l == "yes":
+            base_payload["yes_price"] = limit_price_cents
+        else:
+            base_payload["no_price"] = limit_price_cents
+
+        ioc_variants: List[Tuple[str, Dict[str, Any]]] = [
+            ("time_in_force=immediate_or_cancel", {**base_payload, "time_in_force": "immediate_or_cancel"}),
+            ("time_in_force=IOC", {**base_payload, "time_in_force": "IOC"}),
+            ("timeInForce=immediate_or_cancel", {**base_payload, "timeInForce": "immediate_or_cancel"}),
+            ("timeInForce=IOC", {**base_payload, "timeInForce": "IOC"}),
+        ]
+        gtc_variants: List[Tuple[str, Dict[str, Any]]] = [
+            ("time_in_force=good_til_cancelled", {**base_payload, "time_in_force": "good_til_cancelled"}),
+            ("time_in_force=GTC", {**base_payload, "time_in_force": "GTC"}),
+            ("timeInForce=good_til_cancelled", {**base_payload, "timeInForce": "good_til_cancelled"}),
+            ("timeInForce=GTC", {**base_payload, "timeInForce": "GTC"}),
+        ]
+        payload_variants: List[Tuple[str, Dict[str, Any]]] = (
+            gtc_variants + ioc_variants if prefer_resting else ioc_variants + gtc_variants
+        )
+
+        last_error = "unknown order error"
+        for variant_name, payload in payload_variants:
+            transient_retries = 2
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    response = requests.post(
+                        f"{KALSHI_API_BASE}/portfolio/orders",
+                        json=payload,
+                        headers=self._get_signed_headers("POST", request_path),
+                        timeout=API_TIMEOUT,
+                    )
+                    if response.status_code == 409:
+                        return (True, "duplicate client_order_id (already placed)")
+                    if response.status_code >= 400:
+                        body = response.text[:400]
+                        last_error = f"{variant_name} -> HTTP {response.status_code}: {body}"
+                        if _is_transient_http_status(response.status_code) and attempt <= transient_retries:
+                            time.sleep(0.35 * attempt)
+                            continue
+                        if response.status_code == 400 and (
+                            ("TimeInForce" in body and "oneof" in body)
+                            or ("invalid_parameters" in body)
+                            or ("invalid_order" in body)
+                        ):
+                            continue
+                    response.raise_for_status()
+                    return (True, f"ok ({variant_name})")
+                except requests.exceptions.HTTPError as exc:
+                    status = exc.response.status_code if exc.response is not None else "unknown"
+                    body = exc.response.text[:400] if exc.response is not None else ""
+                    last_error = f"{variant_name} -> HTTP {status}: {body}"
+                    if isinstance(status, int) and _is_transient_http_status(status) and attempt <= transient_retries:
+                        time.sleep(0.35 * attempt)
+                        continue
+                    if status == 400:
+                        continue
+                    break
+                except requests.exceptions.RequestException as exc:
+                    last_error = f"{variant_name} -> {exc}"
+                    if attempt <= transient_retries:
+                        time.sleep(0.35 * attempt)
+                        continue
+                    break
                 break
 
         return (False, last_error)
@@ -805,15 +1242,45 @@ class KalshiMarketClient(MarketDataSource):
                 continue
         return False
 
+    def has_resting_entry_like_order(
+        self,
+        ticker: str,
+        side: str,
+        price_cents: int,
+    ) -> bool:
+        """Check whether a similar resting buy order already exists."""
+        orders = self.fetch_resting_orders(ticker=ticker)
+        side_l = side.lower()
+        for order in orders:
+            try:
+                if str(order.get("ticker", "")).strip() != ticker:
+                    continue
+                if str(order.get("action", "")).strip().lower() != "buy":
+                    continue
+                if str(order.get("side", "")).strip().lower() != side_l:
+                    continue
+                existing_price = None
+                if side_l == "yes":
+                    existing_price = self._to_cents(order.get("yes_price"))
+                else:
+                    existing_price = self._to_cents(order.get("no_price"))
+                if existing_price is None:
+                    existing_price = self._to_cents(order.get("price"))
+                if existing_price is None:
+                    continue
+                if int(existing_price) == int(price_cents):
+                    return True
+            except Exception:
+                continue
+        return False
+
     def fetch_brackets(self, target_date: str) -> List[MarketBracket]:
         """Fetch all brackets for a target date's temperature market."""
         date_str = format_date_for_ticker(target_date)
         expected_event_ticker = f"{self.series_ticker}-{date_str}"
 
-        markets = self._fetch_markets()
-
-        if not markets:
-            markets = self._fetch_markets(event_ticker=expected_event_ticker)
+        # Query the exact event first so we don't rely on series-level page order.
+        markets = self._fetch_markets(event_ticker=expected_event_ticker)
 
         brackets = []
         for market in markets:

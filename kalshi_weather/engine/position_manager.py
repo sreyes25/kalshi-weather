@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-from kalshi_weather.core.models import OpenPosition, PositionRecommendation
+from kalshi_weather.core.models import BracketType, MarketBracket, OpenPosition, PositionRecommendation
 
 
 def _clamp_cents(value: float) -> int:
@@ -25,15 +25,53 @@ def _liquidation_price_cents(position: OpenPosition) -> Optional[int]:
     return None
 
 
+def _distance_to_losing_edge_f(
+    *,
+    bracket: Optional[MarketBracket],
+    observed_high_f: Optional[float],
+) -> Optional[float]:
+    """Distance from observed high to the next losing edge for a YES bracket."""
+    if bracket is None or observed_high_f is None:
+        return None
+
+    if bracket.bracket_type == BracketType.BETWEEN:
+        return None if bracket.upper_bound is None else float(bracket.upper_bound) - float(observed_high_f)
+
+    if bracket.bracket_type == BracketType.LESS_THAN:
+        return None if bracket.upper_bound is None else float(bracket.upper_bound) - float(observed_high_f)
+
+    if bracket.bracket_type == BracketType.GREATER_THAN:
+        if bracket.lower_bound is None:
+            return None
+        if observed_high_f > float(bracket.lower_bound):
+            return float("inf")
+        return float(bracket.lower_bound) + 1.0 - float(observed_high_f)
+
+    return None
+
+
 def evaluate_open_positions(
     positions: List[OpenPosition],
     model_probabilities: Dict[str, float],
     previous_model_probabilities: Optional[Dict[str, float]] = None,
-    hold_edge_threshold_cents: float = 2.0,
-    sell_edge_threshold_cents: float = -2.0,
+    hold_edge_threshold_cents: float = 3.0,
+    sell_edge_threshold_cents: float = -3.0,
     exit_fee_rate: float = 0.0,
-    trend_weight_cents_per_pp: float = 0.35,
-    max_trend_adjustment_cents: float = 2.0,
+    trend_weight_cents_per_pp: float = 0.22,
+    max_trend_adjustment_cents: float = 1.5,
+    brackets_by_ticker: Optional[Dict[str, MarketBracket]] = None,
+    observed_high_f: Optional[float] = None,
+    final_window_open: bool = False,
+    primary_profit_lock_warn_prob: float = 0.97,
+    primary_profit_lock_trigger_prob: float = 0.99,
+    primary_risk_buffer_f: float = 1.0,
+    primary_flip_risk_by_ticker: Optional[Dict[str, bool]] = None,
+    primary_edge_exceed_prob_by_ticker: Optional[Dict[str, float]] = None,
+    stop_loss_dollars: Optional[float] = None,
+    take_profit_dollars: Optional[float] = None,
+    take_profit_fraction: Optional[float] = None,
+    confidence_drop_trigger_pp: Optional[float] = None,
+    min_model_prob_after_drop: float = 0.0,
 ) -> List[PositionRecommendation]:
     """
     Score open positions with deterministic hold/sell logic.
@@ -85,6 +123,24 @@ def evaluate_open_positions(
 
         side = position.side.upper()
         side_prob = model_yes_prob if side == "YES" else 1.0 - model_yes_prob
+        bracket = (brackets_by_ticker or {}).get(position.ticker)
+        distance_to_losing_edge = _distance_to_losing_edge_f(
+            bracket=bracket,
+            observed_high_f=observed_high_f,
+        )
+        explicit_flip_risk = (
+            (primary_flip_risk_by_ticker or {}).get(position.ticker)
+            if primary_flip_risk_by_ticker is not None
+            else None
+        )
+        flip_risk = explicit_flip_risk
+        if flip_risk is None and distance_to_losing_edge is not None:
+            flip_risk = distance_to_losing_edge <= primary_risk_buffer_f
+        edge_exceed_prob = (
+            (primary_edge_exceed_prob_by_ticker or {}).get(position.ticker)
+            if primary_edge_exceed_prob_by_ticker is not None
+            else None
+        )
         primary_gap_pp = None
         if top_prob is not None:
             primary_gap_pp = (top_prob - side_prob) * 100.0
@@ -97,7 +153,9 @@ def evaluate_open_positions(
 
         trend_adjustment = 0.0
         if side_prob_change_pp is not None:
-            trend_adjustment = side_prob_change_pp * trend_weight_cents_per_pp
+            # Ignore tiny probability jitter to reduce intraday churn.
+            if abs(side_prob_change_pp) >= 0.35:
+                trend_adjustment = side_prob_change_pp * trend_weight_cents_per_pp
             trend_adjustment = max(-max_trend_adjustment_cents, min(max_trend_adjustment_cents, trend_adjustment))
         trend_fair_value = fair_value + trend_adjustment
         liquidation = _liquidation_price_cents(position)
@@ -126,17 +184,94 @@ def evaluate_open_positions(
 
         liquidation_net = float(liquidation) * max(0.0, 1.0 - exit_fee_rate)
         edge = trend_fair_value - liquidation_net
+        pnl_now_dollars = None
+        if position.average_entry_price_cents is not None:
+            pnl_now_dollars = (
+                (liquidation_net - float(position.average_entry_price_cents))
+                * position.contracts
+                / 100.0
+            )
         side_entry_prob = None
         if position.average_entry_price_cents is not None:
             entry_prob = position.average_entry_price_cents / 100.0
             side_entry_prob = entry_prob if side == "YES" else (1.0 - entry_prob)
 
-        if is_primary_outcome and side == "YES":
-            action = "HOLD_PRIMARY"
-            target_exit = _clamp_cents(max(fair_value - 1.0, float(liquidation or 1)))
+        if (
+            pnl_now_dollars is not None
+            and stop_loss_dollars is not None
+            and pnl_now_dollars <= -abs(float(stop_loss_dollars))
+        ):
+            action = "SELL_NOW"
+            target_exit = liquidation
             rationale = (
-                "Primary final-outcome bracket for current model; hold-to-settlement mode active."
+                f"Stop-loss triggered: unrealized P&L {pnl_now_dollars:+.2f} <= "
+                f"-${abs(float(stop_loss_dollars)):.2f}."
             )
+        elif (
+            pnl_now_dollars is not None
+            and take_profit_dollars is not None
+            and pnl_now_dollars >= abs(float(take_profit_dollars))
+        ):
+            action = "SELL_NOW"
+            target_exit = liquidation
+            rationale = (
+                f"Take-profit triggered: unrealized P&L {pnl_now_dollars:+.2f} >= "
+                f"${abs(float(take_profit_dollars)):.2f}."
+            )
+        elif (
+            position.average_entry_price_cents is not None
+            and take_profit_fraction is not None
+            and float(position.average_entry_price_cents) > 0.0
+            and liquidation_net >= float(position.average_entry_price_cents) * (1.0 + max(0.0, float(take_profit_fraction)))
+        ):
+            action = "SELL_NOW"
+            target_exit = liquidation
+            rationale = (
+                f"Take-profit fraction hit: liquidation {liquidation_net:.1f}c >= "
+                f"entry {float(position.average_entry_price_cents):.1f}c * "
+                f"(1 + {max(0.0, float(take_profit_fraction)):.2f})."
+            )
+        elif (
+            side_prob_change_pp is not None
+            and confidence_drop_trigger_pp is not None
+            and side_prob_change_pp <= -abs(float(confidence_drop_trigger_pp))
+            and side_prob <= max(0.0, min(1.0, float(min_model_prob_after_drop)))
+        ):
+            action = "SELL_NOW"
+            target_exit = liquidation
+            rationale = (
+                f"Model confidence dropped {side_prob_change_pp:.1f}pp and current side probability "
+                f"{side_prob:.1%} <= floor {float(min_model_prob_after_drop):.1%}; exit to cut risk."
+            )
+        elif is_primary_outcome and side == "YES" and edge <= sell_edge_threshold_cents:
+            action = "SELL_NOW"
+            target_exit = liquidation
+            rationale = (
+                f"Primary bracket lost model support: trend-adjusted fair value {trend_fair_value:.1f}c "
+                f"is below liquidation {liquidation}c by {abs(edge):.1f}c."
+            )
+        elif is_primary_outcome and side == "YES":
+            target_exit = _clamp_cents(max(fair_value - 1.0, float(liquidation or 1)))
+            force_lock_primary = final_window_open and side_prob >= primary_profit_lock_trigger_prob
+            risk_lock_primary = (
+                final_window_open
+                and side_prob >= primary_profit_lock_warn_prob
+                and bool(flip_risk)
+            )
+            if force_lock_primary or risk_lock_primary:
+                action = "LOCK_PROFIT_PRIMARY"
+                exceed_note = ""
+                if edge_exceed_prob is not None:
+                    exceed_note = f" Edge-exceed risk={edge_exceed_prob:.1%}."
+                rationale = (
+                    f"Primary bracket reached {side_prob:.1%} with unresolved final-window risk; "
+                    f"lock profits via reduce-only target {target_exit}c.{exceed_note}"
+                )
+            else:
+                action = "HOLD_PRIMARY"
+                rationale = (
+                    "Primary final-outcome bracket for current model; hold-to-settlement mode active."
+                )
         elif edge <= sell_edge_threshold_cents:
             action = "SELL_NOW"
             target_exit = liquidation
@@ -201,6 +336,10 @@ def evaluate_open_positions(
                 action=action,
                 target_exit_price_cents=target_exit,
                 rationale=rationale,
+                distance_to_losing_edge_f=distance_to_losing_edge,
+                risk_buffer_f=primary_risk_buffer_f if distance_to_losing_edge is not None else None,
+                final_window_open=final_window_open,
+                edge_exceed_prob=edge_exceed_prob,
             )
         )
 

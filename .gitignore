@@ -12,6 +12,19 @@ build/
 
 # Environment Variables
 .env
+.env.*
+!.env.example
+
+# Runtime / local artifacts
+logs/
+*.sqlite
+*.db
+*.db-journal
+
+# Secrets / keys
+*.pem
+*.key
+*.p12
 
 # IDE
 .vscode/

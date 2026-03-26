@@ -639,19 +639,19 @@ class TestObservationWeight:
         adjuster = ObservationAdjuster(timezone=NYC_TZ)
         hours = adjuster._calculate_hours_since_noon(make_time(15, 0))
         weight = adjuster._calculate_observation_weight(hours)
-        assert 0.5 < weight < 0.6
+        assert abs(weight - 0.5) < 0.01
 
     def test_at_4pm_high_weight(self):
         adjuster = ObservationAdjuster(timezone=NYC_TZ)
         hours = adjuster._calculate_hours_since_noon(make_time(16, 0))
         weight = adjuster._calculate_observation_weight(hours)
-        assert abs(weight - 0.8) < 0.05
+        assert abs(weight - 0.7) < 0.05
 
     def test_at_6pm_very_high_weight(self):
         adjuster = ObservationAdjuster(timezone=NYC_TZ)
         hours = adjuster._calculate_hours_since_noon(make_time(18, 0))
         weight = adjuster._calculate_observation_weight(hours)
-        assert weight > 0.85
+        assert weight > 0.84
 
     def test_late_evening_approaches_max(self):
         adjuster = ObservationAdjuster(timezone=NYC_TZ)
@@ -691,8 +691,8 @@ class TestAdjustedMean:
         result = adjust_forecast_with_observations(
             forecast, observation, current_time=make_time(10, 0)
         )
-        # Before noon, should be pure forecast
-        assert result.mean_temp_f == 55.0
+        # Before noon, forecast should dominate (minor trajectory nudges allowed).
+        assert abs(result.mean_temp_f - 55.0) < 0.1
 
     def test_late_day_mostly_observation(self):
         forecast = make_combined_forecast(mean=55.0)
@@ -721,6 +721,21 @@ class TestAdjustedMean:
         # Should be between forecast and observation, but >= observed
         assert result.mean_temp_f >= 50.0
         assert result.mean_temp_f < 60.0
+
+    def test_mean_and_low_are_clamped_to_effective_high_floor(self):
+        forecast = make_combined_forecast(mean=45.5, std_dev=2.0)
+        # Effective floor is 50.0 via possible_actual_high_high, even if
+        # observed_high_f is lower.
+        observation = make_observation(
+            observed_high=49.0,
+            low_bound=48.5,
+            high_bound=50.0,
+        )
+        result = adjust_forecast_with_observations(
+            forecast, observation, current_time=make_time(16, 0)
+        )
+        assert result.mean_temp_f >= 50.0
+        assert result.low_f >= 50.0
 
 
 # =============================================================================
@@ -829,7 +844,8 @@ class TestAdjustedForecastProperties:
             forecast, observation, current_time=make_time(15, 0)
         )
         assert result.observation is not None
-        assert result.observed_high_f == 54.0
+        # Stored floor uses strongest observed signal (includes possible_actual_high_high).
+        assert result.observed_high_f == 55.0
 
     def test_hours_since_noon_recorded(self):
         forecast = make_combined_forecast()
@@ -895,8 +911,8 @@ class TestObservationAdjusterScenarios:
         result = adjust_forecast_with_observations(
             forecast, observation, current_time=make_time(9, 0)
         )
-        # Morning: pure forecast
-        assert result.mean_temp_f == 55.0
+        # Morning: forecast dominates (minor trajectory nudges allowed).
+        assert abs(result.mean_temp_f - 55.0) < 0.1
         assert result.observation_weight == 0.0
 
     def test_afternoon_warm_observation(self):
@@ -933,6 +949,69 @@ class TestObservationAdjusterScenarios:
         )
         # Agreement should reduce uncertainty somewhat
         assert result.std_dev <= 3.0
+
+    def test_wind_regime_nudge_changes_adjusted_mean(self):
+        """Onshore flow should cool vs westerly flow under otherwise equal inputs."""
+        forecast = make_combined_forecast(mean=63.0, std_dev=2.2)
+
+        def _make_obs(wind_dir_deg: float) -> DailyObservation:
+            readings = [
+                StationReading(
+                    station_id="KNYC",
+                    timestamp=make_time(14, 0),
+                    station_type=StationType.FIVE_MINUTE,
+                    reported_temp_f=60.0,
+                    reported_temp_c=None,
+                    possible_actual_f_low=59.6,
+                    possible_actual_f_high=60.4,
+                    wind_direction_deg=wind_dir_deg,
+                    wind_speed_mph=12.0,
+                ),
+                StationReading(
+                    station_id="KNYC",
+                    timestamp=make_time(14, 30),
+                    station_type=StationType.FIVE_MINUTE,
+                    reported_temp_f=60.5,
+                    reported_temp_c=None,
+                    possible_actual_f_low=60.1,
+                    possible_actual_f_high=60.9,
+                    wind_direction_deg=wind_dir_deg,
+                    wind_speed_mph=12.5,
+                ),
+                StationReading(
+                    station_id="KNYC",
+                    timestamp=make_time(15, 0),
+                    station_type=StationType.FIVE_MINUTE,
+                    reported_temp_f=60.8,
+                    reported_temp_c=None,
+                    possible_actual_f_low=60.4,
+                    possible_actual_f_high=61.2,
+                    wind_direction_deg=wind_dir_deg,
+                    wind_speed_mph=11.8,
+                ),
+            ]
+            return DailyObservation(
+                station_id="KNYC",
+                date=TARGET_DATE,
+                observed_high_f=60.8,
+                possible_actual_high_low=60.4,
+                possible_actual_high_high=61.2,
+                readings=readings,
+                last_updated=readings[-1].timestamp,
+            )
+
+        onshore = adjust_forecast_with_observations(
+            forecast,
+            _make_obs(110.0),  # ESE marine flow
+            current_time=make_time(15, 0),
+        )
+        westerly = adjust_forecast_with_observations(
+            forecast,
+            _make_obs(270.0),  # Westerly continental flow
+            current_time=make_time(15, 0),
+        )
+
+        assert westerly.mean_temp_f > onshore.mean_temp_f
 
 
 # =============================================================================
@@ -1202,6 +1281,29 @@ class TestCalculateAllProbabilities:
         result = results[0]
         assert not result.has_positive_edge
         assert result.edge_direction == "NO"
+
+    def test_viability_mask_zeros_invalid_low_brackets_and_renormalizes(self):
+        brackets = [
+            make_bracket(BracketType.LESS_THAN, upper=48),           # invalid if floor=50
+            make_bracket(BracketType.BETWEEN, lower=48, upper=49),   # invalid if floor=50
+            make_bracket(BracketType.BETWEEN, lower=50, upper=51),   # viable
+            make_bracket(BracketType.BETWEEN, lower=52, upper=53),   # viable
+            make_bracket(BracketType.GREATER_THAN, lower=53),        # viable
+        ]
+        calculator = BracketProbabilityCalculator()
+        results = calculator.calculate_all_probabilities(
+            brackets=brackets,
+            mean=49.0,
+            std_dev=2.0,
+            lower_bound=49.5,  # implies effective floor 50.0
+        )
+        by_subtitle = {r.bracket.subtitle: r.model_prob for r in results}
+        assert by_subtitle["Below 48°"] == 0.0
+        assert by_subtitle["48° to 49°"] == 0.0
+        assert by_subtitle["50° to 51°"] > 0.0
+        assert by_subtitle["52° to 53°"] > 0.0
+        assert by_subtitle["Above 53°"] > 0.0
+        assert abs(sum(by_subtitle.values()) - 1.0) < 1e-6
 
 
 # =============================================================================

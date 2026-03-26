@@ -1,20 +1,26 @@
 import pytest
-from unittest.mock import MagicMock, patch
-from datetime import datetime
+import json
+from unittest.mock import patch
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from kalshi_weather.cli.bot import WeatherBot
 from kalshi_weather.core.models import (
     TemperatureForecast,
     MarketBracket,
     BracketType,
-    TradingSignal
+    TradingSignal,
 )
 
 @pytest.fixture
-def mock_bot_deps():
+def mock_bot_deps(tmp_path):
+    state_path = tmp_path / "source_change_state_fixture.json"
+    events_path = tmp_path / "source_change_events_fixture.jsonl"
     with patch('kalshi_weather.cli.bot.CombinedWeatherSource') as mock_weather, \
          patch('kalshi_weather.cli.bot.NWSStationParser') as mock_station, \
          patch('kalshi_weather.cli.bot.HighTempContract') as mock_contract, \
-         patch('kalshi_weather.cli.bot.Dashboard') as mock_dashboard:
+         patch('kalshi_weather.cli.bot.Dashboard') as mock_dashboard, \
+         patch('kalshi_weather.cli.bot.SOURCE_CHANGE_STATE_PATH', str(state_path)), \
+         patch('kalshi_weather.cli.bot.SOURCE_CHANGE_EVENTS_PATH', str(events_path)):
         
         # Setup mock returns
         bot = WeatherBot(city_code="NYC")
@@ -50,7 +56,7 @@ def test_perform_analysis_flow(mock_bot_deps):
     assert analysis.forecast_mean == 50.0
     
     # Verify calls
-    mock_contract.fetch_forecasts.assert_called_once()
+    assert mock_contract.fetch_forecasts.call_count >= 1
     mock_station.get_daily_summary.assert_called_once()
     mock_contract.fetch_brackets.assert_called_once()
 
@@ -59,3 +65,172 @@ def test_bot_run_structure():
     # This is hard to test without mocking the while loop or Live context.
     # Just verifying imports and instantiation worked in test_perform_analysis_flow.
     pass
+
+
+def test_perform_analysis_resyncs_signal_probs_and_edges(mock_bot_deps):
+    bot, mock_contract, mock_station = mock_bot_deps
+    now = datetime.now()
+    forecast = TemperatureForecast("Test", "2024-01-01", 50.0, 48.0, 52.0, 1.0, now, now)
+    bracket = MarketBracket(
+        "TICKER",
+        "EVENT",
+        "49° to 51°",
+        BracketType.BETWEEN,
+        49,
+        51,
+        10,
+        20,
+        15,
+        100,
+        0.15,
+    )
+    fake_signal = TradingSignal(
+        bracket=bracket,
+        direction="BUY",
+        model_prob=0.99,
+        market_prob=0.01,
+        edge=0.98,
+        confidence=0.99,
+        reasoning="fake stale edge",
+    )
+
+    mock_contract.fetch_forecasts.return_value = [forecast]
+    mock_contract.fetch_brackets.return_value = [bracket]
+    mock_station.get_daily_summary.return_value = None
+    bot.edge_detector.analyze = lambda **kwargs: [fake_signal]
+
+    analysis = bot.perform_analysis()
+    assert len(analysis.signals) == 1
+    synced = analysis.signals[0]
+    expected_model_prob = analysis.model_probabilities[bracket.ticker]
+    assert synced.model_prob == pytest.approx(expected_model_prob, abs=1e-6)
+    assert synced.market_prob == pytest.approx(bracket.implied_prob, abs=1e-6)
+    assert synced.edge == pytest.approx(expected_model_prob - bracket.implied_prob, abs=1e-6)
+    assert synced.edge != pytest.approx(fake_signal.edge, abs=1e-6)
+
+
+def test_source_change_timestamps_persist_across_restarts(tmp_path):
+    state_file = tmp_path / "source_change_state.json"
+    events_file = tmp_path / "source_change_events.jsonl"
+    market_tz = ZoneInfo("America/New_York")
+    now1 = datetime(2026, 3, 26, 2, 56, 0, tzinfo=market_tz)
+    now2 = datetime(2026, 3, 26, 3, 5, 0, tzinfo=market_tz)
+    forecasts = [
+        TemperatureForecast("NWS", "2026-03-26", 72.0, 70.0, 74.0, 2.5, now1, now1)
+    ]
+
+    with patch("kalshi_weather.cli.bot.CombinedWeatherSource"), \
+         patch("kalshi_weather.cli.bot.NWSStationParser"), \
+         patch("kalshi_weather.cli.bot.HighTempContract"), \
+         patch("kalshi_weather.cli.bot.Dashboard"), \
+         patch("kalshi_weather.cli.bot.SOURCE_CHANGE_STATE_PATH", str(state_file)), \
+         patch("kalshi_weather.cli.bot.SOURCE_CHANGE_EVENTS_PATH", str(events_file)):
+        bot1 = WeatherBot(city_code="NYC")
+        first_changed, first_delta = bot1._track_source_forecast_changes(
+            forecasts=forecasts,
+            target_date="2026-03-26",
+            now_market=now1,
+        )
+        assert first_changed["NWS"] == now1
+        assert first_delta["NWS"] is None
+
+    with patch("kalshi_weather.cli.bot.CombinedWeatherSource"), \
+         patch("kalshi_weather.cli.bot.NWSStationParser"), \
+         patch("kalshi_weather.cli.bot.HighTempContract"), \
+         patch("kalshi_weather.cli.bot.Dashboard"), \
+         patch("kalshi_weather.cli.bot.SOURCE_CHANGE_STATE_PATH", str(state_file)), \
+         patch("kalshi_weather.cli.bot.SOURCE_CHANGE_EVENTS_PATH", str(events_file)):
+        bot2 = WeatherBot(city_code="NYC")
+        second_changed, second_delta = bot2._track_source_forecast_changes(
+            forecasts=forecasts,
+            target_date="2026-03-26",
+            now_market=now2,
+        )
+        assert second_changed["NWS"] == now1
+        assert second_delta["NWS"] is None
+
+
+def test_source_change_delta_and_event_log_recorded(tmp_path):
+    state_file = tmp_path / "source_change_state.json"
+    events_file = tmp_path / "source_change_events.jsonl"
+    market_tz = ZoneInfo("America/New_York")
+    now1 = datetime(2026, 3, 26, 3, 0, 0, tzinfo=market_tz)
+    now2 = datetime(2026, 3, 26, 3, 10, 0, tzinfo=market_tz)
+
+    first_forecasts = [
+        TemperatureForecast("NWS", "2026-03-26", 72.0, 70.0, 74.0, 2.5, now1, now1)
+    ]
+    second_forecasts = [
+        TemperatureForecast("NWS", "2026-03-26", 73.3, 71.0, 75.0, 2.5, now2, now2)
+    ]
+
+    with patch("kalshi_weather.cli.bot.CombinedWeatherSource"), \
+         patch("kalshi_weather.cli.bot.NWSStationParser"), \
+         patch("kalshi_weather.cli.bot.HighTempContract"), \
+         patch("kalshi_weather.cli.bot.Dashboard"), \
+         patch("kalshi_weather.cli.bot.SOURCE_CHANGE_STATE_PATH", str(state_file)), \
+         patch("kalshi_weather.cli.bot.SOURCE_CHANGE_EVENTS_PATH", str(events_file)):
+        bot = WeatherBot(city_code="NYC")
+        bot._track_source_forecast_changes(
+            forecasts=first_forecasts,
+            target_date="2026-03-26",
+            now_market=now1,
+        )
+        changed_at, deltas = bot._track_source_forecast_changes(
+            forecasts=second_forecasts,
+            target_date="2026-03-26",
+            now_market=now2,
+        )
+
+    assert changed_at["NWS"] == now2
+    assert deltas["NWS"] == pytest.approx(1.3)
+
+    rows = [
+        json.loads(line)
+        for line in events_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows) >= 2
+    last = rows[-1]
+    assert last["source"] == "NWS"
+    assert last["change_type"] == "update"
+    assert last["delta"] == pytest.approx(1.3)
+    assert last["previous_temp"] == pytest.approx(72.0)
+    assert last["new_temp"] == pytest.approx(73.3)
+
+
+def test_source_change_state_resets_on_new_day(tmp_path):
+    state_file = tmp_path / "source_change_state.json"
+    events_file = tmp_path / "source_change_events.jsonl"
+    market_tz = ZoneInfo("America/New_York")
+    today = datetime.now(market_tz).strftime("%Y-%m-%d")
+    stale_day = (datetime.now(market_tz) - timedelta(days=1)).strftime("%Y-%m-%d")
+    stale_payload = {
+        "version": 1,
+        "city_code": "NYC",
+        "day_anchor": stale_day,
+        "entries": [
+            {
+                "target_date": stale_day,
+                "source": "NWS",
+                "temp_rounded": 65.0,
+                "changed_at": datetime.now(market_tz).isoformat(),
+            }
+        ],
+    }
+    state_file.write_text(json.dumps(stale_payload), encoding="utf-8")
+
+    with patch("kalshi_weather.cli.bot.CombinedWeatherSource"), \
+         patch("kalshi_weather.cli.bot.NWSStationParser"), \
+         patch("kalshi_weather.cli.bot.HighTempContract"), \
+         patch("kalshi_weather.cli.bot.Dashboard"), \
+         patch("kalshi_weather.cli.bot.SOURCE_CHANGE_STATE_PATH", str(state_file)), \
+         patch("kalshi_weather.cli.bot.SOURCE_CHANGE_EVENTS_PATH", str(events_file)):
+        bot = WeatherBot(city_code="NYC")
+        assert bot._source_last_changed_at_by_key == {}
+        assert bot._source_last_forecast_temp_by_key == {}
+        assert bot._source_last_delta_by_key == {}
+
+    saved_payload = json.loads(state_file.read_text(encoding="utf-8"))
+    assert saved_payload["day_anchor"] == today
+    assert saved_payload["entries"] == []

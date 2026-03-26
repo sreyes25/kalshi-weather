@@ -7,7 +7,7 @@ temperature uncertainty bounds.
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List, Optional, Dict
 from zoneinfo import ZoneInfo
 
 import requests
@@ -33,6 +33,72 @@ INTER_READING_UNCERTAINTY = 1.0
 def celsius_to_fahrenheit(celsius: float) -> float:
     """Convert Celsius to Fahrenheit."""
     return celsius * 9.0 / 5.0 + 32.0
+
+
+def _extract_metric_temp_f(metric: object) -> Optional[float]:
+    """
+    Extract a temperature metric object (NWS style) as Fahrenheit.
+
+    Expected shape: {"value": <number>, "unitCode": "..."}.
+    """
+    if not isinstance(metric, dict):
+        return None
+    value = metric.get("value")
+    if value is None:
+        return None
+    try:
+        raw = float(value)
+    except (TypeError, ValueError):
+        return None
+    unit_code = str(metric.get("unitCode", "")).lower()
+    if "degf" in unit_code or "fahrenheit" in unit_code:
+        return raw
+    return celsius_to_fahrenheit(raw)
+
+
+def _extract_metric_scalar(metric: object) -> Optional[float]:
+    """Extract numeric value from an NWS metric object."""
+    if not isinstance(metric, dict):
+        return None
+    value = metric.get("value")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_wind_direction_deg(metric: object) -> Optional[float]:
+    """Extract wind direction in degrees from an NWS metric object."""
+    value = _extract_metric_scalar(metric)
+    if value is None:
+        return None
+    # Normalize to [0, 360)
+    deg = value % 360.0
+    if deg < 0:
+        deg += 360.0
+    return round(deg, 1)
+
+
+def _extract_wind_speed_mph(metric: object) -> Optional[float]:
+    """Extract wind speed (mph) from an NWS metric object."""
+    if not isinstance(metric, dict):
+        return None
+    value = _extract_metric_scalar(metric)
+    if value is None:
+        return None
+    unit_code = str(metric.get("unitCode", "")).lower()
+
+    mph = value
+    if "m_s" in unit_code or "m/s" in unit_code:
+        mph = value * 2.236936
+    elif "km_h" in unit_code or "kph" in unit_code:
+        mph = value * 0.621371
+    elif "knot" in unit_code or "kn" in unit_code:
+        mph = value * 1.150779
+    # Else assume mph-like unit.
+    return round(max(0.0, mph), 1)
 
 
 def calculate_temp_bounds(
@@ -98,6 +164,8 @@ def parse_observation(obs: dict, station_type: StationType, station_id: str) -> 
         unit_code = temp_data.get("unitCode", "")
         dewpoint_data = properties.get("dewpoint", {})
         humidity_data = properties.get("relativeHumidity", {})
+        wind_direction_data = properties.get("windDirection", {})
+        wind_speed_data = properties.get("windSpeed", {})
 
         if temp_value is None:
             return None
@@ -135,6 +203,9 @@ def parse_observation(obs: dict, station_type: StationType, station_id: str) -> 
             except (TypeError, ValueError):
                 relative_humidity_pct = None
 
+        wind_direction_deg = _extract_wind_direction_deg(wind_direction_data)
+        wind_speed_mph = _extract_wind_speed_mph(wind_speed_data)
+
         return StationReading(
             station_id=station_id,
             timestamp=timestamp,
@@ -145,6 +216,8 @@ def parse_observation(obs: dict, station_type: StationType, station_id: str) -> 
             possible_actual_f_high=round(high_f, 1),
             dewpoint_f=dewpoint_f,
             relative_humidity_pct=relative_humidity_pct,
+            wind_direction_deg=wind_direction_deg,
+            wind_speed_mph=wind_speed_mph,
         )
     except (ValueError, TypeError, KeyError) as e:
         logger.warning(f"Failed to parse observation: {e}")
@@ -189,7 +262,14 @@ def get_recent_observation_history(
     age_cutoff = now_local.timestamp() - max_age_hours * 3600.0
     fresh = [r for r in same_day if r.timestamp.astimezone(timezone).timestamp() >= age_cutoff]
 
-    series = fresh if fresh else same_day
+    # Keep at least two points for trend estimation when available, even if one
+    # point falls just outside max_age_hours.
+    if len(fresh) >= 2:
+        series = fresh
+    elif len(same_day) >= 2:
+        series = same_day
+    else:
+        series = fresh if fresh else same_day
     return series[-max(2, window_size):]
 
 
@@ -233,8 +313,12 @@ class NWSStationParser(StationDataSource):
 
     def _fetch_latest_observation(self) -> Optional[dict]:
         """Fetch latest single observation and return as feature-like dict."""
+        return self._fetch_latest_observation_for_station(self.station_id)
+
+    def _fetch_latest_observation_for_station(self, station_id: str) -> Optional[dict]:
+        """Fetch latest single observation for any station id."""
         try:
-            url = f"{NWS_STATIONS_URL.format(station_id=self.station_id)}/latest"
+            url = f"{NWS_STATIONS_URL.format(station_id=station_id)}/latest"
             response = requests.get(
                 url,
                 headers=self._get_headers(),
@@ -249,6 +333,45 @@ class NWSStationParser(StationDataSource):
             return None
         except (ValueError, KeyError):
             return None
+
+    def fetch_latest_station_reading(self, station_id: str) -> Optional[StationReading]:
+        """
+        Fetch and parse the latest reading for a specific station.
+        """
+        raw = self._fetch_latest_observation_for_station(station_id=station_id)
+        if not raw:
+            return None
+        return parse_observation(raw, StationType.UNKNOWN, station_id)
+
+    def summarize_nearby_nowcast(self, station_ids: List[str]) -> Dict[str, float]:
+        """
+        Fetch latest readings for nearby stations and return a compact summary.
+        """
+        cleaned_ids = [s.strip().upper() for s in station_ids if s and s.strip()]
+        if not cleaned_ids:
+            return {}
+
+        readings: List[StationReading] = []
+        for sid in cleaned_ids:
+            reading = self.fetch_latest_station_reading(sid)
+            if reading:
+                readings.append(reading)
+
+        if not readings:
+            return {}
+
+        now_local = datetime.now(self.timezone)
+        temps = [r.reported_temp_f for r in readings]
+        ages_min = [
+            max(0.0, (now_local - r.timestamp.astimezone(self.timezone)).total_seconds() / 60.0)
+            for r in readings
+        ]
+        return {
+            "count": float(len(readings)),
+            "max_temp_f": max(temps),
+            "mean_temp_f": sum(temps) / len(temps),
+            "freshest_age_min": min(ages_min),
+        }
 
     def _fetch_raw_observations(
         self,
@@ -361,10 +484,20 @@ class NWSStationParser(StationDataSource):
             return None
         station_type = self._station_type or StationType.UNKNOWN
         readings: List[StationReading] = []
+        max_temp_last_6h_f: Optional[float] = None
         for obs in raw_observations:
             reading = parse_observation(obs, station_type, self.station_id)
             if reading:
                 readings.append(reading)
+                if reading.timestamp.astimezone(self.timezone).date() == target_date:
+                    six_hour_metric = obs.get("properties", {}).get("maxTemperatureLast6Hours")
+                    six_hour_high = _extract_metric_temp_f(six_hour_metric)
+                    if six_hour_high is not None:
+                        max_temp_last_6h_f = (
+                            six_hour_high
+                            if max_temp_last_6h_f is None
+                            else max(max_temp_last_6h_f, six_hour_high)
+                        )
 
         if not readings:
             return None
@@ -376,10 +509,37 @@ class NWSStationParser(StationDataSource):
         daily_readings.sort(key=lambda r: r.timestamp)
 
         if not daily_readings:
+            # Early-day / feed-lag fallback:
+            # if querying "today" and no same-day rows have posted yet, keep the
+            # pipeline alive with the freshest recent observation.
+            if target_date == now_local.date() and readings:
+                freshest = max(readings, key=lambda r: r.timestamp)
+                freshest_local = freshest.timestamp.astimezone(self.timezone)
+                age_min = max(0.0, (now_local - freshest_local).total_seconds() / 60.0)
+                if age_min <= 180.0:
+                    observed_high_f = freshest.reported_temp_f
+                    max_possible_high = freshest.possible_actual_f_high
+                    possible_actual_high_high = max_possible_high + INTER_READING_UNCERTAINTY
+                    possible_actual_high_low = observed_high_f - HOURLY_F_UNCERTAINTY
+                    return DailyObservation(
+                        station_id=self.station_id,
+                        date=date,
+                        observed_high_f=round(observed_high_f, 1),
+                        possible_actual_high_low=round(possible_actual_high_low, 1),
+                        possible_actual_high_high=round(possible_actual_high_high, 1),
+                        reported_series_high_f=round(observed_high_f, 1),
+                        reported_max_6h_f=round(max_temp_last_6h_f, 1) if max_temp_last_6h_f is not None else None,
+                        readings=[freshest],
+                        last_updated=datetime.now(self.timezone),
+                    )
             return None
 
         max_reading = max(daily_readings, key=lambda r: r.reported_temp_f)
-        observed_high_f = max_reading.reported_temp_f
+        reported_series_high_f = max_reading.reported_temp_f
+        observed_high_f = reported_series_high_f
+        if max_temp_last_6h_f is not None:
+            # Use the station's rolling 6-hour maximum as an additional high watermark.
+            observed_high_f = max(observed_high_f, max_temp_last_6h_f)
 
         max_possible_high = max(r.possible_actual_f_high for r in daily_readings)
         possible_actual_high_high = max_possible_high + INTER_READING_UNCERTAINTY
@@ -391,6 +551,8 @@ class NWSStationParser(StationDataSource):
             observed_high_f=observed_high_f,
             possible_actual_high_low=round(possible_actual_high_low, 1),
             possible_actual_high_high=round(possible_actual_high_high, 1),
+            reported_series_high_f=round(reported_series_high_f, 1),
+            reported_max_6h_f=round(max_temp_last_6h_f, 1) if max_temp_last_6h_f is not None else None,
             readings=daily_readings,
             last_updated=datetime.now(self.timezone),
         )

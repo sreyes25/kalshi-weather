@@ -78,6 +78,8 @@ class StationReading:
     possible_actual_f_high: float  # Upper bound of actual temp
     dewpoint_f: Optional[float] = None
     relative_humidity_pct: Optional[float] = None
+    wind_direction_deg: Optional[float] = None
+    wind_speed_mph: Optional[float] = None
 
 
 @dataclass
@@ -92,6 +94,8 @@ class DailyObservation:
     observed_high_f: float         # Highest reading seen on time series
     possible_actual_high_low: float   # Actual settlement high could be this low
     possible_actual_high_high: float  # Actual settlement high could be this high
+    reported_series_high_f: Optional[float] = None   # Max from fetched observation series
+    reported_max_6h_f: Optional[float] = None        # NWS maxTemperatureLast6Hours
     readings: List[StationReading] = field(default_factory=list)
     last_updated: Optional[datetime] = None
 
@@ -186,6 +190,10 @@ class PositionRecommendation:
     action: str
     target_exit_price_cents: Optional[int]
     rationale: str
+    distance_to_losing_edge_f: Optional[float] = None
+    risk_buffer_f: Optional[float] = None
+    final_window_open: bool = False
+    edge_exceed_prob: Optional[float] = None
 
 
 @dataclass
@@ -201,6 +209,47 @@ class TrajectoryAssessment:
     lock_confidence: float
     trend_f_per_hour: float
     reasoning: str
+
+
+@dataclass
+class PeakPrediction:
+    """
+    Early estimate of final daily high and confidence.
+
+    This is used by the decision engine for timing/feasibility checks and by
+    the dashboard for explicit "predicted high" output.
+    """
+    predicted_high_f: float
+    confidence: float
+    expected_remaining_warming_f: float
+    trend_f_per_hour: float
+    max_feasible_temp_f: Optional[float] = None
+    reasoning: str = ""
+
+
+@dataclass
+class TradeDecisionSnapshot:
+    """
+    Structured summary of the current entry decision.
+
+    status values:
+    - "TRADE": all filters passed and a trade was selected
+    - "SKIP": at least one quality/risk filter blocked entry
+    """
+    status: str
+    reason: str
+    ticker: Optional[str] = None
+    bracket_subtitle: Optional[str] = None
+    yes_price_cents: Optional[int] = None
+    model_prob: Optional[float] = None
+    market_prob: Optional[float] = None
+    edge: Optional[float] = None
+    confidence: Optional[float] = None
+    size_contracts: Optional[int] = None
+    target_exit_price_cents: Optional[int] = None
+    max_feasible_temp_f: Optional[float] = None
+    timing_lag_pp: Optional[float] = None
+    model_trend_pp: Optional[float] = None
 
 
 @dataclass
@@ -225,12 +274,18 @@ class MarketAnalysis:
     adjusted_forecast_std: Optional[float] = None  # Post-observation/trajectory std
     tomorrow_date: Optional[str] = None            # YYYY-MM-DD reference
     tomorrow_forecast_mean: Optional[float] = None # Forecast-only mean for tomorrow
+    source_last_changed_at: Dict[str, datetime] = field(default_factory=dict)  # source -> last value-change time
+    source_last_change_delta: Dict[str, Optional[float]] = field(default_factory=dict)  # source -> signed delta at last value-change
     model_probabilities: Dict[str, float] = field(default_factory=dict)  # ticker -> probability
     open_positions: List[PositionRecommendation] = field(default_factory=list)
+    account_open_positions: List[OpenPosition] = field(default_factory=list)
     auto_trader_events: List[str] = field(default_factory=list)
     position_lifecycle_events: List[str] = field(default_factory=list)
     trajectory_assessment: Optional[TrajectoryAssessment] = None
     portfolio_totals: Dict[str, float] = field(default_factory=dict)
+    paper_trading_totals: Dict[str, float] = field(default_factory=dict)
+    peak_prediction: Optional[PeakPrediction] = None
+    decision_snapshot: Optional[TradeDecisionSnapshot] = None
 
 
 # =============================================================================

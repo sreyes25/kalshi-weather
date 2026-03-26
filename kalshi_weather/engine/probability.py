@@ -16,6 +16,7 @@ Module 2C: Bracket Probability Calculator
 
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -23,6 +24,14 @@ from zoneinfo import ZoneInfo
 
 from scipy.stats import norm
 
+from kalshi_weather.config.settings import (
+    ACCUWEATHER_WEIGHT,
+    WIND_ADVECTION_NUDGE_ENABLED,
+    WIND_ADVECTION_MIN_SPEED_MPH,
+    WIND_ADVECTION_ONSHORE_NUDGE_F,
+    WIND_ADVECTION_OFFSHORE_NUDGE_F,
+    WIND_ADVECTION_NUDGE_CAP_F,
+)
 from kalshi_weather.core import (
     TemperatureForecast,
     DailyObservation,
@@ -48,6 +57,8 @@ DEFAULT_WEIGHTS: Dict[str, float] = {
     "NWS": 5.0,
     # ECMWF is generally considered the best global model
     "ECMWF": 4.0,
+    # AccuWeather daily high guidance (official API, when enabled)
+    "AccuWeather": ACCUWEATHER_WEIGHT,
     # Open-Meteo Best Match blends multiple models intelligently
     "Open-Meteo Best Match": 3.5,
     # GFS+HRRR combination - good for short-term US forecasts
@@ -66,6 +77,9 @@ MIN_STD_DEV: float = 1.5
 
 # Maximum standard deviation cap (sanity check)
 MAX_STD_DEV: float = 10.0
+USE_RUNTIME_SOURCE_CORRECTIONS: bool = os.getenv(
+    "USE_RUNTIME_SOURCE_CORRECTIONS", "true"
+).strip().lower() == "true"
 
 
 def _safe_linear_trend_per_hour(values: List[tuple[float, float]]) -> float:
@@ -85,6 +99,50 @@ def _safe_linear_trend_per_hour(values: List[tuple[float, float]]) -> float:
     if denom <= 1e-9:
         return 0.0
     return sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys)) / denom
+
+
+def _circular_mean_degrees(values: List[float]) -> Optional[float]:
+    """Return circular mean direction in degrees."""
+    if not values:
+        return None
+    sin_sum = 0.0
+    cos_sum = 0.0
+    for deg in values:
+        rad = math.radians(float(deg))
+        sin_sum += math.sin(rad)
+        cos_sum += math.cos(rad)
+    if abs(sin_sum) < 1e-9 and abs(cos_sum) < 1e-9:
+        return None
+    mean_rad = math.atan2(sin_sum, cos_sum)
+    mean_deg = math.degrees(mean_rad)
+    if mean_deg < 0:
+        mean_deg += 360.0
+    return mean_deg
+
+
+def _effective_high_floor(observation: Optional[DailyObservation]) -> Optional[float]:
+    """
+    Return a conservative floor for today's final high from live observations.
+
+    Uses the strongest observed signal available to prevent impossible
+    below-floor outcomes from retaining model probability.
+    """
+    if observation is None:
+        return None
+    candidates: List[float] = []
+    for value in (
+        observation.observed_high_f,
+        observation.reported_series_high_f,
+        observation.reported_max_6h_f,
+        observation.possible_actual_high_high,
+    ):
+        if value is None:
+            continue
+        try:
+            candidates.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    return max(candidates) if candidates else None
 
 
 # =============================================================================
@@ -357,7 +415,10 @@ def combine_forecasts(
     Returns:
         CombinedForecast or None if no valid forecasts.
     """
-    combiner = ForecastCombiner(weights=weights)
+    combiner = ForecastCombiner(
+        weights=weights,
+        use_auto_corrections=USE_RUNTIME_SOURCE_CORRECTIONS,
+    )
     return combiner.combine(forecasts)
 
 
@@ -367,11 +428,12 @@ def combine_forecasts(
 
 # Time-based weight thresholds (hours after noon in local time)
 EARLY_CUTOFF_HOURS = 2.0   # Before 2 PM: mostly forecast
-LATE_CUTOFF_HOURS = 4.0    # After 4 PM: mostly observation
-MAX_OBSERVATION_WEIGHT = 0.95  # Never fully trust observations (measurement error)
+LATE_CUTOFF_HOURS = 4.5    # After ~4:30 PM: mostly observation
+MAX_OBSERVATION_WEIGHT = 0.92  # Keep a modest tail to avoid over-locking
 
 # Observation uncertainty floor
 MIN_OBSERVATION_STD = 0.5  # Minimum std dev when using observations
+FLOAT_EPS = 1e-9
 
 
 @dataclass
@@ -503,7 +565,7 @@ class ObservationAdjuster:
     def _calculate_adjusted_mean(
         self,
         forecast_mean: float,
-        observed_high: float,
+        effective_high_floor: float,
         observation_weight: float,
     ) -> float:
         """
@@ -513,10 +575,10 @@ class ObservationAdjuster:
         (since the actual high can't be lower than what we've already seen).
         """
         forecast_weight = 1.0 - observation_weight
-        blended_mean = forecast_weight * forecast_mean + observation_weight * observed_high
+        blended_mean = forecast_weight * forecast_mean + observation_weight * effective_high_floor
 
         # The high temperature can't be lower than what we've observed
-        return max(blended_mean, observed_high)
+        return max(blended_mean, effective_high_floor)
 
     def _calculate_adjusted_std_dev(
         self,
@@ -605,11 +667,12 @@ class ObservationAdjuster:
         # Calculate time-based weight
         observation_weight = self._calculate_observation_weight(hours_since_noon)
         forecast_weight = 1.0 - observation_weight
+        effective_floor = _effective_high_floor(observation) or observation.observed_high_f
 
         # Calculate adjusted mean
         adjusted_mean = self._calculate_adjusted_mean(
             combined_forecast.mean_temp_f,
-            observation.observed_high_f,
+            effective_floor,
             observation_weight,
         )
 
@@ -651,7 +714,7 @@ class ObservationAdjuster:
 
         trajectory = self.trajectory_engine.assess(
             current_time=assessment_time,
-            observed_high_f=observation.observed_high_f,
+            observed_high_f=effective_floor,
             recent_readings=recent_history,
             combined_forecast=combined_forecast,
         )
@@ -667,6 +730,8 @@ class ObservationAdjuster:
         temp_points: List[tuple[float, float]] = []
         dew_points: List[tuple[float, float]] = []
         rh_points: List[tuple[float, float]] = []
+        wind_dirs_deg: List[float] = []
+        wind_speeds_mph: List[float] = []
         if anchor_time is not None:
             for row in recent_history:
                 x = (row.timestamp - anchor_time).total_seconds() / 3600.0
@@ -675,9 +740,19 @@ class ObservationAdjuster:
                     dew_points.append((x, row.dewpoint_f))
                 if row.relative_humidity_pct is not None:
                     rh_points.append((x, row.relative_humidity_pct))
+                if row.wind_direction_deg is not None:
+                    wind_dirs_deg.append(float(row.wind_direction_deg))
+                if row.wind_speed_mph is not None:
+                    wind_speeds_mph.append(float(row.wind_speed_mph))
         dew_trend_f_per_hour = _safe_linear_trend_per_hour(dew_points)
         rh_trend_pct_per_hour = _safe_linear_trend_per_hour(rh_points)
         temp_trend_f_per_hour = _safe_linear_trend_per_hour(temp_points)
+        mean_wind_dir_deg = _circular_mean_degrees(wind_dirs_deg)
+        mean_wind_speed_mph = (
+            (sum(wind_speeds_mph) / len(wind_speeds_mph))
+            if wind_speeds_mph
+            else None
+        )
         stale_observation_window = latest_age_hours > 2.0
         lock_mode = (
             hours_since_noon >= LATE_CUTOFF_HOURS
@@ -687,19 +762,19 @@ class ObservationAdjuster:
             and trajectory.lock_confidence >= 0.75
             and not stale_observation_window
         )
-        conditioning_cutoff = observation.observed_high_f - 0.5
+        conditioning_cutoff = effective_floor - 0.5
         conditioning_ceiling = None
         if lock_mode:
-            conditioning_ceiling = observation.observed_high_f + max(
+            conditioning_ceiling = effective_floor + max(
                 1.4,
                 trajectory.expected_remaining_warming_f + 0.9,
             )
 
         # Trajectory conditioning: late-day lock collapses around observed high,
         # while preserving a right tail when trajectory supports remaining upside.
-        target_mean = observation.observed_high_f + trajectory.expected_remaining_warming_f
+        target_mean = effective_floor + trajectory.expected_remaining_warming_f
         if lock_mode:
-            target_mean = observation.observed_high_f + min(
+            target_mean = effective_floor + min(
                 0.3,
                 0.25 * trajectory.expected_remaining_warming_f,
             )
@@ -720,7 +795,7 @@ class ObservationAdjuster:
             blend_weight *= 0.35
 
         conditioned_mean = (1.0 - blend_weight) * adjusted_mean + blend_weight * target_mean
-        conditioned_mean = max(observation.observed_high_f, conditioned_mean)
+        conditioned_mean = max(effective_floor, conditioned_mean)
 
         # Humidity/dewpoint nowcast nudge:
         # rising dewpoint + rising RH tends to support persistence; falling both
@@ -736,22 +811,47 @@ class ObservationAdjuster:
             elif temp_trend_f_per_hour <= -0.25 and dew_trend_f_per_hour < 0.0:
                 humidity_nudge -= 0.07
         humidity_nudge = max(-0.30, min(0.30, humidity_nudge))
-        conditioned_mean = max(observation.observed_high_f, conditioned_mean + humidity_nudge)
+        wind_nudge = 0.0
+        if (
+            WIND_ADVECTION_NUDGE_ENABLED
+            and latest_age_hours <= 1.5
+            and mean_wind_dir_deg is not None
+            and mean_wind_speed_mph is not None
+            and mean_wind_speed_mph >= WIND_ADVECTION_MIN_SPEED_MPH
+        ):
+            # Approximate wind-regime adjustment:
+            # - 45..170 degrees: onshore/marine flow tends to cap warming in NYC.
+            # - 220..320 degrees: westerly/continental flow tends to support warming.
+            if 45.0 <= mean_wind_dir_deg <= 170.0:
+                wind_nudge = min(0.0, WIND_ADVECTION_ONSHORE_NUDGE_F)
+                if dew_trend_f_per_hour >= 0.2 and rh_trend_pct_per_hour >= 0.8:
+                    wind_nudge *= 1.25
+            elif 220.0 <= mean_wind_dir_deg <= 320.0:
+                wind_nudge = max(0.0, WIND_ADVECTION_OFFSHORE_NUDGE_F)
+                if dew_trend_f_per_hour <= -0.2 or rh_trend_pct_per_hour <= -0.8:
+                    wind_nudge *= 1.20
+        wind_nudge = max(
+            -abs(WIND_ADVECTION_NUDGE_CAP_F),
+            min(abs(WIND_ADVECTION_NUDGE_CAP_F), wind_nudge),
+        )
+        conditioned_mean = max(effective_floor, conditioned_mean + humidity_nudge + wind_nudge)
 
         std_scale = 1.0 - 0.50 * blend_weight
         if lock_mode:
             std_scale *= 0.70
         conditioned_std = max(self.min_std_dev, adjusted_std * max(0.35, std_scale))
-        low_f = max(conditioning_cutoff, conditioned_mean - z_10 * conditioned_std)
+        low_f = max(effective_floor, conditioning_cutoff, conditioned_mean - z_10 * conditioned_std)
         high_f = conditioned_mean + z_10 * conditioned_std
-        max_possible = max(max_possible, observation.observed_high_f + trajectory.expected_remaining_warming_f + conditioned_std)
+        max_possible = max(max_possible, effective_floor + trajectory.expected_remaining_warming_f + conditioned_std)
 
         logger.info(
             f"Adjusted forecast: mean={conditioned_mean:.1f}°F (was {combined_forecast.mean_temp_f:.1f}°F), "
             f"std={conditioned_std:.2f}°F, obs_weight={observation_weight:.2f}, "
             f"lock={trajectory.lock_confidence:.2f}, lock_mode={lock_mode}, stale_obs={stale_observation_window}, "
+            f"wind={mean_wind_dir_deg if mean_wind_dir_deg is not None else 'NA'}deg/"
+            f"{mean_wind_speed_mph if mean_wind_speed_mph is not None else 'NA'}mph, "
             f"dew_trend={dew_trend_f_per_hour:+.2f}F/hr, rh_trend={rh_trend_pct_per_hour:+.2f}%/hr, "
-            f"humidity_nudge={humidity_nudge:+.2f}F"
+            f"humidity_nudge={humidity_nudge:+.2f}F, wind_nudge={wind_nudge:+.2f}F"
         )
 
         return AdjustedForecast(
@@ -765,7 +865,7 @@ class ObservationAdjuster:
             observation_weight=observation_weight,
             forecast_weight=forecast_weight,
             hours_since_noon=hours_since_noon,
-            observed_high_f=observation.observed_high_f,
+            observed_high_f=effective_floor,
             min_possible_high=min_possible,
             max_possible_high=max_possible,
             conditioning_cutoff_f=conditioning_cutoff,
@@ -932,6 +1032,7 @@ class BracketProbabilityCalculator:
         std_dev: float,
         lower_bound: Optional[float] = None,
         upper_bound: Optional[float] = None,
+        viability_floor_f: Optional[float] = None,
     ) -> List[BracketProbability]:
         """
         Calculate probabilities for all brackets.
@@ -945,6 +1046,7 @@ class BracketProbabilityCalculator:
             List of BracketProbability objects with model vs market comparison
         """
         results = []
+        is_exhaustive = self._is_exhaustive_structure(brackets)
 
         for bracket in brackets:
             model_prob = self.calculate_bracket_probability(
@@ -971,7 +1073,20 @@ class BracketProbabilityCalculator:
                 edge_pct=edge * 100,
             ))
 
-        if results and self._is_exhaustive_structure(brackets):
+        implied_floor = viability_floor_f
+        if implied_floor is None and lower_bound is not None:
+            implied_floor = lower_bound + 0.5
+        if implied_floor is not None:
+            self._apply_viability_mask_and_renormalize(
+                results,
+                effective_high_floor=float(implied_floor),
+                renormalize=is_exhaustive,
+            )
+            for bp in results:
+                bp.edge = bp.model_prob - bp.market_prob
+                bp.edge_pct = bp.edge * 100
+
+        if results and is_exhaustive:
             total = sum(bp.model_prob for bp in results)
             if total > 0:
                 for bp in results:
@@ -987,6 +1102,78 @@ class BracketProbabilityCalculator:
         )
 
         return results
+
+    def _bracket_upper_bound_for_viability(self, bracket: MarketBracket) -> Optional[float]:
+        if bracket.bracket_type == BracketType.BETWEEN:
+            return bracket.upper_bound
+        if bracket.bracket_type == BracketType.LESS_THAN:
+            return bracket.upper_bound
+        return None
+
+    def _bracket_distance_to_value(self, bracket: MarketBracket, value: float) -> float:
+        if bracket.bracket_type == BracketType.BETWEEN:
+            if bracket.lower_bound is None or bracket.upper_bound is None:
+                return float("inf")
+            if bracket.lower_bound <= value <= bracket.upper_bound:
+                return 0.0
+            if value < bracket.lower_bound:
+                return bracket.lower_bound - value
+            return value - bracket.upper_bound
+        if bracket.bracket_type == BracketType.GREATER_THAN:
+            if bracket.lower_bound is None:
+                return float("inf")
+            return 0.0 if value > bracket.lower_bound else (bracket.lower_bound - value + 1e-6)
+        if bracket.bracket_type == BracketType.LESS_THAN:
+            if bracket.upper_bound is None:
+                return float("inf")
+            return 0.0 if value < bracket.upper_bound else (value - bracket.upper_bound + 1e-6)
+        return float("inf")
+
+    def _apply_viability_mask_and_renormalize(
+        self,
+        results: List[BracketProbability],
+        *,
+        effective_high_floor: float,
+        renormalize: bool = True,
+    ) -> None:
+        """
+        Enforce strict viability:
+        - Any bracket with upper bound strictly below observed/effective high is impossible -> 0.
+        - Redistribute removed mass across remaining viable brackets via renormalization.
+        """
+        if not results:
+            return
+
+        removed_mass = 0.0
+        viable: List[BracketProbability] = []
+        for bp in results:
+            upper = self._bracket_upper_bound_for_viability(bp.bracket)
+            if upper is not None and float(upper) < float(effective_high_floor):
+                removed_mass += max(0.0, bp.model_prob)
+                bp.model_prob = 0.0
+                continue
+            viable.append(bp)
+
+        if not viable:
+            return
+
+        if not renormalize:
+            return
+
+        viable_mass = sum(max(0.0, bp.model_prob) for bp in viable)
+        if viable_mass > 0.0:
+            inv = 1.0 / viable_mass
+            for bp in viable:
+                bp.model_prob = max(0.0, min(1.0, bp.model_prob * inv))
+            return
+
+        # Degenerate fallback: assign all mass to the nearest viable bracket.
+        anchor = min(
+            viable,
+            key=lambda bp: self._bracket_distance_to_value(bp.bracket, float(effective_high_floor)),
+        )
+        for bp in viable:
+            bp.model_prob = 1.0 if bp is anchor else 0.0
 
     def _condition_to_bounds(
         self,
@@ -1007,7 +1194,7 @@ class BracketProbabilityCalculator:
 
         lower = lower_bound if lower_bound is not None else float("-inf")
         upper = upper_bound if upper_bound is not None else float("inf")
-        if upper <= lower:
+        if upper < lower or math.isclose(upper, lower, abs_tol=FLOAT_EPS):
             return self.min_prob
 
         lower_cdf = 0.0 if lower == float("-inf") else normal_cdf(lower, mean, std_dev)
@@ -1035,7 +1222,7 @@ class BracketProbabilityCalculator:
 
         clipped_left = max(left, lower)
         clipped_right = min(right, upper)
-        if clipped_right <= clipped_left:
+        if clipped_right < clipped_left or math.isclose(clipped_right, clipped_left, abs_tol=FLOAT_EPS):
             return self.min_prob
 
         if clipped_right == float("inf"):

@@ -129,12 +129,12 @@ class EdgeDetector(EdgeEngine):
         - Magnitude of edge (larger is better)
         - Forecast uncertainty (lower std dev is better)
         """
-        # 1. Edge Score: Map 0.05-0.20 edge to 0.5-1.0
-        edge_score = min(1.0, max(0.0, (edge - 0.05) / 0.15 * 0.5 + 0.5))
+        # 1. Edge Score: Map 0.06-0.20 edge to 0.45-1.0
+        edge_score = min(1.0, max(0.0, (edge - 0.06) / 0.14 * 0.55 + 0.45))
         
-        # 2. Uncertainty Score: Map 1.5-5.0 std dev to 1.0-0.5
+        # 2. Uncertainty Score: Map 1.5-5.0 std dev to 1.0-0.35
         # Lower std dev = higher confidence
-        unc_score = max(0.0, min(1.0, 1.0 - (std_dev - 1.5) / 3.5 * 0.5))
+        unc_score = max(0.0, min(1.0, 1.0 - (std_dev - 1.5) / 3.5 * 0.65))
         
         return (edge_score + unc_score) / 2.0
 

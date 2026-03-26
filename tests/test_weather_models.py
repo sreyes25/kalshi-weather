@@ -72,6 +72,29 @@ NWS_FORECAST_RESPONSE = {
     }
 }
 
+MAPCLICK_DWML_URL = (
+    f"https://forecast.weather.gov/MapClick.php"
+    f"?lat={NYC.lat}&lon={NYC.lon}&unit=0&lg=english&FcstType=dwml"
+)
+
+
+def make_mapclick_dwml(target_date: str, high_f: int) -> str:
+    return f"""<?xml version="1.0" encoding="ISO-8859-1"?>
+<dwml>
+  <data type="forecast">
+    <time-layout>
+      <layout-key>k-p24h-n1-2</layout-key>
+      <start-valid-time period-name="Day">{target_date}T06:00:00-05:00</start-valid-time>
+    </time-layout>
+    <parameters>
+      <temperature type="maximum" units="Fahrenheit" time-layout="k-p24h-n1-2">
+        <name>Daily Maximum Temperature</name>
+        <value>{high_f}</value>
+      </temperature>
+    </parameters>
+  </data>
+</dwml>"""
+
 
 # =============================================================================
 # OPEN-METEO SOURCE TESTS
@@ -164,16 +187,28 @@ class TestNWSForecastSource:
 
     @responses.activate
     def test_fetch_forecast_success(self):
-        responses.add(responses.GET, f"{NWS_API_BASE}/points/{NYC.lat},{NYC.lon}", json=NWS_POINTS_RESPONSE, status=200)
-        responses.add(responses.GET, NWS_POINTS_RESPONSE["properties"]["forecast"], json=NWS_FORECAST_RESPONSE, status=200)
+        responses.add(
+            responses.GET,
+            MAPCLICK_DWML_URL,
+            body=make_mapclick_dwml(TARGET_DATE, 54),
+            status=200,
+            content_type="application/xml",
+        )
         source = NWSForecastSource(NYC)
         forecasts = source.fetch_forecasts(TARGET_DATE)
         assert len(forecasts) == 1
         assert forecasts[0].source == "NWS"
-        assert forecasts[0].forecast_temp_f == 50.0
+        assert forecasts[0].forecast_temp_f == 54.0
 
     @responses.activate
     def test_missing_target_date(self):
+        responses.add(
+            responses.GET,
+            MAPCLICK_DWML_URL,
+            body=make_mapclick_dwml("2026-01-19", 45),
+            status=200,
+            content_type="application/xml",
+        )
         responses.add(responses.GET, f"{NWS_API_BASE}/points/{NYC.lat},{NYC.lon}", json=NWS_POINTS_RESPONSE, status=200)
         forecast_without_date = {"properties": {"periods": [{"startTime": "2026-01-19T06:00:00-05:00", "isDaytime": True, "temperature": 45}]}}
         responses.add(responses.GET, NWS_POINTS_RESPONSE["properties"]["forecast"], json=forecast_without_date, status=200)
@@ -183,6 +218,13 @@ class TestNWSForecastSource:
 
     @responses.activate
     def test_points_api_error(self):
+        responses.add(
+            responses.GET,
+            MAPCLICK_DWML_URL,
+            body=make_mapclick_dwml("2026-01-19", 45),
+            status=200,
+            content_type="application/xml",
+        )
         responses.add(responses.GET, f"{NWS_API_BASE}/points/{NYC.lat},{NYC.lon}", status=500)
         source = NWSForecastSource(NYC)
         forecasts = source.fetch_forecasts(TARGET_DATE)
@@ -190,6 +232,13 @@ class TestNWSForecastSource:
 
     @responses.activate
     def test_forecast_api_error(self):
+        responses.add(
+            responses.GET,
+            MAPCLICK_DWML_URL,
+            body=make_mapclick_dwml("2026-01-19", 45),
+            status=200,
+            content_type="application/xml",
+        )
         responses.add(responses.GET, f"{NWS_API_BASE}/points/{NYC.lat},{NYC.lon}", json=NWS_POINTS_RESPONSE, status=200)
         responses.add(responses.GET, NWS_POINTS_RESPONSE["properties"]["forecast"], status=500)
         source = NWSForecastSource(NYC)
@@ -199,6 +248,13 @@ class TestNWSForecastSource:
     @responses.activate
     def test_api_timeout(self):
         from requests.exceptions import Timeout
+        responses.add(
+            responses.GET,
+            MAPCLICK_DWML_URL,
+            body=make_mapclick_dwml("2026-01-19", 45),
+            status=200,
+            content_type="application/xml",
+        )
         responses.add(responses.GET, f"{NWS_API_BASE}/points/{NYC.lat},{NYC.lon}", body=Timeout("Connection timed out"))
         source = NWSForecastSource(NYC)
         forecasts = source.fetch_forecasts(TARGET_DATE)
@@ -206,6 +262,13 @@ class TestNWSForecastSource:
 
     @responses.activate
     def test_only_returns_daytime_forecast(self):
+        responses.add(
+            responses.GET,
+            MAPCLICK_DWML_URL,
+            body=make_mapclick_dwml("2026-01-19", 45),
+            status=200,
+            content_type="application/xml",
+        )
         responses.add(responses.GET, f"{NWS_API_BASE}/points/{NYC.lat},{NYC.lon}", json=NWS_POINTS_RESPONSE, status=200)
         nighttime_only = {"properties": {"periods": [{"startTime": "2026-01-20T18:00:00-05:00", "isDaytime": False, "temperature": 40}]}}
         responses.add(responses.GET, NWS_POINTS_RESPONSE["properties"]["forecast"], json=nighttime_only, status=200)
@@ -227,8 +290,13 @@ class TestCombinedWeatherSource:
         responses.add(responses.GET, OPEN_METEO_FORECAST_URL, json=OPEN_METEO_BEST_MATCH_RESPONSE, status=200)
         responses.add(responses.GET, OPEN_METEO_GFS_URL, json=OPEN_METEO_GFS_RESPONSE, status=200)
         responses.add(responses.GET, OPEN_METEO_ENSEMBLE_URL, json=make_ensemble_response(TARGET_DATE, ENSEMBLE_TEMPS), status=200)
-        responses.add(responses.GET, f"{NWS_API_BASE}/points/{NYC.lat},{NYC.lon}", json=NWS_POINTS_RESPONSE, status=200)
-        responses.add(responses.GET, NWS_POINTS_RESPONSE["properties"]["forecast"], json=NWS_FORECAST_RESPONSE, status=200)
+        responses.add(
+            responses.GET,
+            MAPCLICK_DWML_URL,
+            body=make_mapclick_dwml(TARGET_DATE, 50),
+            status=200,
+            content_type="application/xml",
+        )
         source = CombinedWeatherSource(NYC)
         forecasts = source.fetch_forecasts(TARGET_DATE)
         assert len(forecasts) == 4
@@ -238,6 +306,13 @@ class TestCombinedWeatherSource:
         responses.add(responses.GET, OPEN_METEO_FORECAST_URL, json=OPEN_METEO_BEST_MATCH_RESPONSE, status=200)
         responses.add(responses.GET, OPEN_METEO_GFS_URL, status=500)
         responses.add(responses.GET, OPEN_METEO_ENSEMBLE_URL, status=500)
+        responses.add(
+            responses.GET,
+            MAPCLICK_DWML_URL,
+            body=make_mapclick_dwml("2026-01-19", 45),
+            status=200,
+            content_type="application/xml",
+        )
         responses.add(responses.GET, f"{NWS_API_BASE}/points/{NYC.lat},{NYC.lon}", status=500)
         source = CombinedWeatherSource(NYC)
         forecasts = source.fetch_forecasts(TARGET_DATE)
@@ -257,8 +332,13 @@ class TestFetchAllForecasts:
         responses.add(responses.GET, OPEN_METEO_FORECAST_URL, json=OPEN_METEO_BEST_MATCH_RESPONSE, status=200)
         responses.add(responses.GET, OPEN_METEO_GFS_URL, json=OPEN_METEO_GFS_RESPONSE, status=200)
         responses.add(responses.GET, OPEN_METEO_ENSEMBLE_URL, json=make_ensemble_response(TARGET_DATE, ENSEMBLE_TEMPS), status=200)
-        responses.add(responses.GET, f"{NWS_API_BASE}/points/{NYC.lat},{NYC.lon}", json=NWS_POINTS_RESPONSE, status=200)
-        responses.add(responses.GET, NWS_POINTS_RESPONSE["properties"]["forecast"], json=NWS_FORECAST_RESPONSE, status=200)
+        responses.add(
+            responses.GET,
+            MAPCLICK_DWML_URL,
+            body=make_mapclick_dwml(TARGET_DATE, 50),
+            status=200,
+            content_type="application/xml",
+        )
         forecasts = fetch_all_forecasts(TARGET_DATE, NYC)
         assert len(forecasts) == 4
 
@@ -267,8 +347,13 @@ class TestFetchAllForecasts:
         responses.add(responses.GET, OPEN_METEO_FORECAST_URL, json=OPEN_METEO_BEST_MATCH_RESPONSE, status=200)
         responses.add(responses.GET, OPEN_METEO_GFS_URL, json=OPEN_METEO_GFS_RESPONSE, status=200)
         responses.add(responses.GET, OPEN_METEO_ENSEMBLE_URL, json=make_ensemble_response(TARGET_DATE, ENSEMBLE_TEMPS), status=200)
-        responses.add(responses.GET, f"{NWS_API_BASE}/points/{NYC.lat},{NYC.lon}", json=NWS_POINTS_RESPONSE, status=200)
-        responses.add(responses.GET, NWS_POINTS_RESPONSE["properties"]["forecast"], json=NWS_FORECAST_RESPONSE, status=200)
+        responses.add(
+            responses.GET,
+            MAPCLICK_DWML_URL,
+            body=make_mapclick_dwml(TARGET_DATE, 50),
+            status=200,
+            content_type="application/xml",
+        )
         forecasts = fetch_all_forecasts(TARGET_DATE)
         assert len(forecasts) == 4
 
