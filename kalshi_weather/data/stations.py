@@ -311,6 +311,37 @@ class NWSStationParser(StationDataSource):
         except ValueError:
             return None
 
+    def _usable_cached_observations(self, max_age_minutes: float = 120.0) -> List[dict]:
+        """
+        Return cached observations only when they are still reasonably fresh.
+        """
+        if not self._cached_observations:
+            return []
+        parsed = [
+            self._parse_obs_timestamp(row)
+            for row in self._cached_observations
+            if isinstance(row, dict)
+        ]
+        parsed = [ts for ts in parsed if ts is not None]
+        if not parsed:
+            return []
+        freshest_local = max(parsed).astimezone(self.timezone)
+        age_minutes = max(
+            0.0,
+            (datetime.now(self.timezone) - freshest_local).total_seconds() / 60.0,
+        )
+        if age_minutes > max_age_minutes:
+            logger.warning(
+                (
+                    "Cached NWS observations are stale (age=%.0fm > %.0fm); "
+                    "ignoring cache until upstream recovers."
+                ),
+                age_minutes,
+                max_age_minutes,
+            )
+            return []
+        return list(self._cached_observations)
+
     def _fetch_latest_observation(self) -> Optional[dict]:
         """Fetch latest single observation and return as feature-like dict."""
         return self._fetch_latest_observation_for_station(self.station_id)
@@ -433,21 +464,23 @@ class NWSStationParser(StationDataSource):
             return features
         except requests.exceptions.RequestException as e:
             logger.warning(f"Failed to fetch NWS observations: {e}")
-            if self._cached_observations:
+            cached = self._usable_cached_observations()
+            if cached:
                 logger.warning(
                     "Using cached NWS observations (%d rows) due to fetch failure.",
-                    len(self._cached_observations),
+                    len(cached),
                 )
-                return list(self._cached_observations)
+                return cached
             return []
         except (ValueError, KeyError) as e:
             logger.warning(f"Failed to parse NWS observations response: {e}")
-            if self._cached_observations:
+            cached = self._usable_cached_observations()
+            if cached:
                 logger.warning(
                     "Using cached NWS observations (%d rows) due to parse failure.",
-                    len(self._cached_observations),
+                    len(cached),
                 )
-                return list(self._cached_observations)
+                return cached
             return []
 
     def fetch_current_observations(self) -> List[StationReading]:

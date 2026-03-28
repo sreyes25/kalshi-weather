@@ -142,6 +142,14 @@ from kalshi_weather.config.settings import (
     ALERT_BRACKET_CHANGE_ENABLED,
     ALERT_LLM_PROMPT_ENABLED,
     ALERT_TOP_BRACKETS,
+    ALERT_SOURCE_CHANGE_ENABLED,
+    ALERT_SOURCE_CHANGE_MIN_DELTA_F,
+    ALERT_OBS_DIVERGENCE_ENABLED,
+    ALERT_OBS_DIVERGENCE_TEMP_F,
+    ALERT_OBS_DIVERGENCE_EXCEED_PROB,
+    ALERT_OBS_DIVERGENCE_LOCK_CONFIDENCE,
+    ALERT_HOURLY_UPDATE_ENABLED,
+    ALERT_HOURLY_UPDATE_MINUTE_LOCAL,
     API_TIMEOUT,
     NEARBY_STATION_IDS,
     NEARBY_STATION_INFLUENCE,
@@ -299,6 +307,173 @@ def _nowcast_score(temp_trend: float, dew_trend: float, rh_trend: float) -> floa
     return max(-100.0, min(100.0, score))
 
 
+def _observation_age_minutes(observation: DailyObservation | None, now_local: datetime) -> float | None:
+    if observation is None or not observation.readings:
+        return None
+    latest = observation.readings[-1].timestamp
+    if latest.tzinfo is None:
+        latest_local = latest.replace(tzinfo=now_local.tzinfo)
+    else:
+        latest_local = latest.astimezone(now_local.tzinfo)
+    return max(0.0, (now_local - latest_local).total_seconds() / 60.0)
+
+
+def _project_midnight_carryover_floor_f(
+    *,
+    observation: DailyObservation | None,
+    tomorrow_date: str | None,
+    now_local: datetime,
+) -> float | None:
+    """
+    Estimate a conservative midnight carryover floor for tomorrow's high.
+
+    Late-day warmth can roll into just after midnight and become tomorrow's high.
+    We project local midnight temperature from recent in-day trend, then use that
+    as a floor candidate for tomorrow's modeled mean.
+    """
+    if observation is None or not observation.readings or not tomorrow_date:
+        return None
+    if now_local.tzinfo is None:
+        return None
+
+    try:
+        obs_date = datetime.strptime(observation.date, "%Y-%m-%d").date()
+        next_date = datetime.strptime(tomorrow_date, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+    if next_date != (obs_date + timedelta(days=1)):
+        return None
+
+    latest = max(observation.readings, key=lambda r: r.timestamp)
+    latest_local = latest.timestamp.astimezone(now_local.tzinfo)
+    if latest_local.date() != obs_date:
+        return None
+    # Night-high logic should only engage in the evening/night window.
+    if latest_local.hour < 18:
+        return None
+
+    midnight_local = datetime.combine(next_date, datetime.min.time(), tzinfo=now_local.tzinfo)
+    hours_to_midnight = (midnight_local - latest_local).total_seconds() / 3600.0
+    # Only apply late in the day where midnight carryover is meaningful.
+    if hours_to_midnight <= 0.0 or hours_to_midnight > 8.0:
+        return None
+
+    window_start = latest_local - timedelta(hours=3)
+    trend_points: list[tuple[float, float]] = []
+    for reading in observation.readings:
+        ts_local = reading.timestamp.astimezone(now_local.tzinfo)
+        if ts_local.date() != obs_date:
+            continue
+        if ts_local < window_start or ts_local > latest_local:
+            continue
+        x_hours = (ts_local - window_start).total_seconds() / 3600.0
+        trend_points.append((x_hours, float(reading.reported_temp_f)))
+
+    trend_f_per_hour = _safe_linear_trend_per_hour(trend_points)
+    # This adjustment is specifically for a post-peak cooling regime.
+    # If temperatures are still rising meaningfully, do not apply it.
+    if trend_f_per_hour > 0.25:
+        return None
+    trend_f_per_hour = max(-8.0, min(0.0, trend_f_per_hour))
+    latest_temp_f = float(latest.reported_temp_f)
+    projected_midnight_f = latest_temp_f + trend_f_per_hour * hours_to_midnight
+
+    # Cooling-only midnight projection; never exceed the latest observed temp.
+    carryover_floor_f = min(latest_temp_f, projected_midnight_f)
+    carryover_floor_f = max(latest_temp_f - 12.0, carryover_floor_f)
+    return round(carryover_floor_f, 1)
+
+
+def _evening_to_midnight_reference_temp_f(
+    *,
+    observation: DailyObservation | None,
+    tomorrow_date: str | None,
+    now_local: datetime,
+) -> float | None:
+    """
+    Return a recent evening-to-midnight temperature reference for tomorrow checks.
+    """
+    if observation is None or not observation.readings or not tomorrow_date:
+        return None
+    if now_local.tzinfo is None:
+        return None
+
+    try:
+        obs_date = datetime.strptime(observation.date, "%Y-%m-%d").date()
+        next_date = datetime.strptime(tomorrow_date, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+    if next_date != (obs_date + timedelta(days=1)):
+        return None
+
+    latest = max(observation.readings, key=lambda r: r.timestamp)
+    latest_local = latest.timestamp.astimezone(now_local.tzinfo)
+    if latest_local.date() != obs_date:
+        return None
+    if latest_local.hour < 18:
+        return None
+
+    midnight_local = datetime.combine(next_date, datetime.min.time(), tzinfo=now_local.tzinfo)
+    hours_to_midnight = (midnight_local - latest_local).total_seconds() / 3600.0
+    if hours_to_midnight <= 0.0 or hours_to_midnight > 8.0:
+        return None
+
+    evening_candidates: list[float] = []
+    for reading in observation.readings:
+        ts_local = reading.timestamp.astimezone(now_local.tzinfo)
+        if ts_local.date() != obs_date:
+            continue
+        if ts_local.hour < 18:
+            continue
+        if ts_local > latest_local:
+            continue
+        evening_candidates.append(float(reading.reported_temp_f))
+
+    if not evening_candidates:
+        return None
+    return max(evening_candidates)
+
+
+def _apply_tomorrow_midnight_carryover_floor(
+    *,
+    tomorrow_mean_f: float | None,
+    tomorrow_date: str | None,
+    now_local: datetime,
+    observation: DailyObservation | None,
+) -> float | None:
+    """
+    Raise tomorrow's forecast mean when late-day carryover implies a higher floor.
+    """
+    if tomorrow_mean_f is None:
+        return _project_midnight_carryover_floor_f(
+            observation=observation,
+            tomorrow_date=tomorrow_date,
+            now_local=now_local,
+        )
+    evening_reference_f = _evening_to_midnight_reference_temp_f(
+        observation=observation,
+        tomorrow_date=tomorrow_date,
+        now_local=now_local,
+    )
+    if evening_reference_f is None:
+        return float(tomorrow_mean_f)
+    # Only trigger night-high prediction when tomorrow mean is below
+    # observed evening-to-midnight temperature context.
+    if float(tomorrow_mean_f) >= float(evening_reference_f):
+        return float(tomorrow_mean_f)
+
+    carryover_floor_f = _project_midnight_carryover_floor_f(
+        observation=observation,
+        tomorrow_date=tomorrow_date,
+        now_local=now_local,
+    )
+    if carryover_floor_f is None:
+        return float(tomorrow_mean_f)
+    return max(float(tomorrow_mean_f), float(carryover_floor_f))
+
+
 class WeatherBot:
     """
     Main bot controller.
@@ -348,7 +523,10 @@ class WeatherBot:
         self._remote_kill_warned = False
         self._previous_yes_ask_by_ticker: dict[str, int] = {}
         self._loss_alert_active_by_position_key: dict[str, bool] = {}
+        self._source_change_alert_last_notified_at_by_key: dict[tuple[str, str], datetime] = {}
+        self._obs_divergence_alert_active_by_target_date: dict[str, bool] = {}
         self._last_primary_ticker_by_target_date: dict[str, str] = {}
+        self._last_hourly_update_key: Optional[str] = None
         self._last_notification_sent_at: Optional[datetime] = None
         self._notification_config_warned = False
         self._journal = TradeJournal(TRADE_JOURNAL_DB_PATH)
@@ -932,7 +1110,7 @@ class WeatherBot:
                 f"- {ticker} {side} qty={qty} entry={entry_c:.1f}c mark={mark_c:.1f}c "
                 f"loss={drawdown:.1%} pnl={pnl_dollars:+.2f}$ action={action}"
             )
-        lines.append("Manual check recommended: consider reducing or exiting before deeper drawdown.")
+        lines.append("Action: SELL/REDUCE flagged position(s) now unless you have stronger contrary data.")
         return "\n".join(lines)
 
     def _detect_drawdown_alerts(
@@ -1128,6 +1306,274 @@ class WeatherBot:
         message = self._build_drawdown_alert_message(threshold=threshold, triggered_rows=triggered)
         self._send_alert_message(message, force=True)
 
+    def _build_source_change_alert_message(
+        self,
+        *,
+        analysis: MarketAnalysis,
+        changed_rows: list[tuple[str, float, float, datetime]],
+    ) -> str:
+        mean_f = (
+            analysis.adjusted_forecast_mean
+            if analysis.adjusted_forecast_mean is not None
+            else analysis.forecast_mean
+        )
+        std_f = (
+            analysis.adjusted_forecast_std
+            if analysis.adjusted_forecast_std is not None
+            else analysis.forecast_std
+        )
+        lines = [
+            (
+                f"KWBOT SOURCE UPDATE ({analysis.city}) "
+                f"{analysis.target_date} {datetime.now(self._market_tz).strftime('%H:%M')}"
+            ),
+            f"Model now: {mean_f:.1f}F +/- {std_f:.1f}F",
+        ]
+        if analysis.observation is not None:
+            lines.append(f"Observed high: {analysis.observation.observed_high_f:.1f}F")
+            if analysis.observation.readings:
+                lines.append(f"Current temp: {analysis.observation.readings[-1].reported_temp_f:.1f}F")
+        for source, temp_f, delta_f, changed_at in changed_rows:
+            changed_local = changed_at.astimezone(self._market_tz).strftime("%H:%M")
+            lines.append(
+                f"- {source}: {temp_f:.1f}F (delta {delta_f:+.1f}F @ {changed_local})"
+            )
+        lines.append("Manual check: source inputs moved; review bracket exposure.")
+        return "\n".join(lines)
+
+    def _maybe_alert_on_source_change(self, analysis: MarketAnalysis) -> None:
+        if not ALERT_SOURCE_CHANGE_ENABLED:
+            return
+        min_delta = max(0.0, float(ALERT_SOURCE_CHANGE_MIN_DELTA_F))
+        changed_rows: list[tuple[str, float, float, datetime]] = []
+        for fc in analysis.forecasts:
+            source = str(fc.source)
+            delta = analysis.source_last_change_delta.get(source)
+            changed_at = analysis.source_last_changed_at.get(source)
+            if delta is None or changed_at is None:
+                continue
+            try:
+                delta_f = float(delta)
+            except (TypeError, ValueError):
+                continue
+            if abs(delta_f) < min_delta:
+                continue
+            key = (analysis.target_date, source)
+            prior_notified = self._source_change_alert_last_notified_at_by_key.get(key)
+            if prior_notified is not None and changed_at <= prior_notified:
+                continue
+            self._source_change_alert_last_notified_at_by_key[key] = changed_at
+            changed_rows.append((source, float(fc.forecast_temp_f), delta_f, changed_at))
+
+        if not changed_rows:
+            return
+        changed_rows.sort(key=lambda row: row[0].lower())
+        message = self._build_source_change_alert_message(
+            analysis=analysis,
+            changed_rows=changed_rows,
+        )
+        self._send_alert_message(message, force=False)
+
+    def _build_observation_divergence_alert_message(
+        self,
+        *,
+        analysis: MarketAnalysis,
+        direction: str,
+        model_mean_f: float,
+        model_std_f: float,
+        current_temp_f: float,
+        observed_high_f: float,
+        gap_current_f: float,
+        gap_high_f: float,
+    ) -> str:
+        traj = analysis.trajectory_assessment
+        lines = [
+            (
+                f"KWBOT LIVE DIVERGENCE ({analysis.city}) "
+                f"{analysis.target_date} {datetime.now(self._market_tz).strftime('%H:%M')}"
+            ),
+            f"Signal: {direction}",
+            f"Model mean/std: {model_mean_f:.1f}F +/- {model_std_f:.1f}F",
+            (
+                f"Current temp: {current_temp_f:.1f}F (gap {gap_current_f:+.1f}F), "
+                f"Observed high: {observed_high_f:.1f}F (gap {gap_high_f:+.1f}F)"
+            ),
+        ]
+        if traj is not None:
+            lines.append(
+                (
+                    "Trajectory: "
+                    f"exceed_high={traj.prob_exceed_observed_high:.0%}, "
+                    f"lock_conf={traj.lock_confidence:.0%}, "
+                    f"trend={traj.trend_f_per_hour:+.2f}F/hr"
+                )
+            )
+        if analysis.open_positions:
+            lines.append("Open positions:")
+            for rec in analysis.open_positions[:4]:
+                pos = rec.position
+                entry = pos.average_entry_price_cents
+                mark = rec.liquidation_net_cents
+                lines.append(
+                    f"- {pos.ticker} {pos.side} qty={pos.contracts} entry={entry} mark={mark} action={rec.action}"
+                )
+        lines.append("Manual decision: re-check thesis; trim/exit risk if mismatch persists.")
+        return "\n".join(lines)
+
+    def _maybe_alert_on_observation_divergence(self, analysis: MarketAnalysis) -> None:
+        if not ALERT_OBS_DIVERGENCE_ENABLED:
+            return
+        obs = analysis.observation
+        traj = analysis.trajectory_assessment
+        key = analysis.target_date
+        if obs is None or traj is None:
+            self._obs_divergence_alert_active_by_target_date[key] = False
+            return
+
+        model_mean = (
+            analysis.adjusted_forecast_mean
+            if analysis.adjusted_forecast_mean is not None
+            else analysis.forecast_mean
+        )
+        model_std = (
+            analysis.adjusted_forecast_std
+            if analysis.adjusted_forecast_std is not None
+            else analysis.forecast_std
+        )
+        current_temp = (
+            float(obs.readings[-1].reported_temp_f)
+            if obs.readings
+            else float(obs.observed_high_f)
+        )
+        observed_high = float(obs.observed_high_f)
+        gap_current = current_temp - float(model_mean)
+        gap_high = observed_high - float(model_mean)
+
+        threshold_f = max(0.5, float(ALERT_OBS_DIVERGENCE_TEMP_F))
+        exceed_prob_threshold = max(0.0, min(1.0, float(ALERT_OBS_DIVERGENCE_EXCEED_PROB)))
+        lock_conf_threshold = max(0.0, min(1.0, float(ALERT_OBS_DIVERGENCE_LOCK_CONFIDENCE)))
+
+        hotter_than_model = (
+            (gap_current >= threshold_f or gap_high >= threshold_f)
+            and float(traj.prob_exceed_observed_high) >= exceed_prob_threshold
+        )
+        cooler_than_model = (
+            (gap_current <= -threshold_f and gap_high <= -threshold_f)
+            and float(traj.lock_confidence) >= lock_conf_threshold
+            and float(traj.trend_f_per_hour) <= 0.15
+        )
+        triggered = hotter_than_model or cooler_than_model
+        was_active = self._obs_divergence_alert_active_by_target_date.get(key, False)
+        self._obs_divergence_alert_active_by_target_date[key] = triggered
+        if not triggered or was_active:
+            return
+
+        direction = "live temperatures are running HOTTER than model"
+        if cooler_than_model:
+            direction = "live temperatures are running COOLER than model"
+        message = self._build_observation_divergence_alert_message(
+            analysis=analysis,
+            direction=direction,
+            model_mean_f=float(model_mean),
+            model_std_f=float(model_std),
+            current_temp_f=float(current_temp),
+            observed_high_f=float(observed_high),
+            gap_current_f=float(gap_current),
+            gap_high_f=float(gap_high),
+        )
+        self._send_alert_message(message, force=True)
+
+    def _build_hourly_update_message(
+        self,
+        *,
+        analysis: MarketAnalysis,
+        now_local: datetime,
+    ) -> str:
+        model_mean = (
+            analysis.adjusted_forecast_mean
+            if analysis.adjusted_forecast_mean is not None
+            else analysis.forecast_mean
+        )
+        model_std = (
+            analysis.adjusted_forecast_std
+            if analysis.adjusted_forecast_std is not None
+            else analysis.forecast_std
+        )
+        top_bracket_line = "n/a"
+        if analysis.model_probabilities and analysis.brackets:
+            top_ticker, top_prob = max(analysis.model_probabilities.items(), key=lambda item: item[1])
+            bracket = next((b for b in analysis.brackets if b.ticker == top_ticker), None)
+            if bracket is not None:
+                top_bracket_line = (
+                    f"{bracket.subtitle} model={float(top_prob):.1%} "
+                    f"mkt={float(bracket.implied_prob):.1%}"
+                )
+            else:
+                top_bracket_line = f"{top_ticker} model={float(top_prob):.1%}"
+
+        current_temp = None
+        observed_high = None
+        if analysis.observation is not None:
+            observed_high = float(analysis.observation.observed_high_f)
+            if analysis.observation.readings:
+                current_temp = float(analysis.observation.readings[-1].reported_temp_f)
+
+        tomorrow_line = "n/a"
+        if analysis.tomorrow_date and analysis.tomorrow_forecast_mean is not None:
+            tomorrow_line = f"{analysis.tomorrow_date}: {float(analysis.tomorrow_forecast_mean):.1f}F"
+        elif analysis.tomorrow_date:
+            tomorrow_line = f"{analysis.tomorrow_date}: n/a"
+
+        worst_drawdown = 0.0
+        for rec in analysis.open_positions:
+            pos = rec.position
+            entry = pos.average_entry_price_cents
+            mark = rec.liquidation_net_cents
+            if entry is None or mark is None or float(entry) <= 0.0:
+                continue
+            dd = max(0.0, (float(entry) - float(mark)) / float(entry))
+            worst_drawdown = max(worst_drawdown, dd)
+
+        lines = [
+            f"KWBOT HOURLY UPDATE {now_local.strftime('%Y-%m-%d %H:%M %Z')}",
+            f"Target: {analysis.target_date}",
+            f"Model: {float(model_mean):.1f}F +/- {float(model_std):.1f}F",
+            (
+                f"Current/High: {current_temp:.1f}F / {observed_high:.1f}F"
+                if current_temp is not None and observed_high is not None
+                else "Current/High: n/a"
+            ),
+            f"Top bracket: {top_bracket_line}",
+            f"Tm prediction: {tomorrow_line}",
+            (
+                f"Open positions: {len(analysis.open_positions)} "
+                f"(worst drawdown {worst_drawdown:.1%})"
+            ),
+        ]
+        return "\n".join(lines)
+
+    def _maybe_send_hourly_update(
+        self,
+        analysis: MarketAnalysis,
+        *,
+        now_local: Optional[datetime] = None,
+    ) -> None:
+        if not ALERT_HOURLY_UPDATE_ENABLED:
+            return
+        now_local = now_local or datetime.now(self._market_tz)
+        minute_target = max(0, min(59, int(ALERT_HOURLY_UPDATE_MINUTE_LOCAL)))
+        if now_local.minute < minute_target:
+            return
+        hour_key = now_local.strftime("%Y-%m-%d %H")
+        if self._last_hourly_update_key == hour_key:
+            return
+        message = self._build_hourly_update_message(
+            analysis=analysis,
+            now_local=now_local,
+        )
+        if self._send_alert_message(message, force=True):
+            self._last_hourly_update_key = hour_key
+
     def _maybe_alert_on_bracket_shift(self, analysis: MarketAnalysis) -> None:
         if not ALERT_BRACKET_CHANGE_ENABLED:
             return
@@ -1157,7 +1603,10 @@ class WeatherBot:
     def _process_notifications(self, analysis: MarketAnalysis) -> None:
         if not self._notifications_config_ready():
             return
+        self._maybe_send_hourly_update(analysis)
+        self._maybe_alert_on_source_change(analysis)
         self._maybe_alert_on_drawdown(analysis)
+        self._maybe_alert_on_observation_divergence(analysis)
         self._maybe_alert_on_bracket_shift(analysis)
 
     def perform_analysis(self) -> MarketAnalysis:
@@ -1255,10 +1704,23 @@ class WeatherBot:
         # - `live_observation` drives dashboard/auto-buy trend checks.
         missing_target_obs = target_date not in self._cached_observations_by_date
         missing_live_obs = (target_date != now_market_day) and (now_market_day not in self._cached_observations_by_date)
+        cached_live_observation = (
+            self._cached_observations_by_date.get(now_market_day)
+            if target_date != now_market_day
+            else self._cached_observations_by_date.get(target_date)
+        )
+        live_obs_age_min = _observation_age_minutes(cached_live_observation, now_market)
+        stale_live_obs = live_obs_age_min is not None and live_obs_age_min > 75.0
+        if stale_live_obs:
+            logger.warning(
+                "Live observation appears stale (age=%.0fm); forcing immediate refresh.",
+                float(live_obs_age_min),
+            )
         should_refresh_observations = (
             (not self._event_driven_scheduler_enabled)
             or missing_target_obs
             or missing_live_obs
+            or stale_live_obs
             or (self._next_metar_refresh_at is None)
             or (now_market >= self._next_metar_refresh_at)
         )
@@ -1278,6 +1740,16 @@ class WeatherBot:
                 live_observation = self._cached_observations_by_date.get(now_market_day)
             else:
                 live_observation = target_observation
+        live_obs_age_after_fetch = _observation_age_minutes(live_observation, now_market)
+        if live_obs_age_after_fetch is not None and live_obs_age_after_fetch > 90.0:
+            logger.warning(
+                (
+                    "Live observation remains stale after refresh (age=%.0fm, station=%s). "
+                    "Likely upstream NWS/API lag or connectivity issue."
+                ),
+                float(live_obs_age_after_fetch),
+                self.station_source.station_id,
+            )
         same_day_target = target_date == now_market_day
         
         # 4. Run Edge Detection
@@ -1308,6 +1780,27 @@ class WeatherBot:
         combined = combine_forecasts(forecasts) if forecasts else None
         adjusted = None
         tomorrow_combined = combine_forecasts(tomorrow_forecasts) if tomorrow_forecasts else None
+        raw_tomorrow_mean_f = tomorrow_combined.mean_temp_f if tomorrow_combined else None
+        tomorrow_forecast_mean = _apply_tomorrow_midnight_carryover_floor(
+            tomorrow_mean_f=raw_tomorrow_mean_f,
+            tomorrow_date=next_day_date,
+            now_local=now_market,
+            observation=live_observation,
+        )
+        if (
+            raw_tomorrow_mean_f is not None
+            and tomorrow_forecast_mean is not None
+            and tomorrow_forecast_mean > float(raw_tomorrow_mean_f)
+        ):
+            logger.info(
+                (
+                    "Tomorrow forecast carryover floor applied for %s: "
+                    "raw=%.1fF adjusted=%.1fF"
+                ),
+                next_day_date,
+                float(raw_tomorrow_mean_f),
+                float(tomorrow_forecast_mean),
+            )
         model_probabilities: dict[str, float] = {}
         if combined and brackets:
             adjusted = adjust_forecast_with_observations(combined, target_observation)
@@ -1796,7 +2289,7 @@ class WeatherBot:
             adjusted_forecast_mean=adjusted.mean_temp_f if adjusted else None,
             adjusted_forecast_std=adjusted.std_dev if adjusted else None,
             tomorrow_date=next_day_date,
-            tomorrow_forecast_mean=tomorrow_combined.mean_temp_f if tomorrow_combined else None,
+            tomorrow_forecast_mean=tomorrow_forecast_mean,
             source_last_changed_at=source_last_changed_at,
             source_last_change_delta=source_last_change_delta,
             model_probabilities=model_probabilities,

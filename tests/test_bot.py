@@ -3,12 +3,20 @@ import json
 from unittest.mock import patch
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from kalshi_weather.cli.bot import WeatherBot
+from kalshi_weather.cli.bot import (
+    WeatherBot,
+    _apply_tomorrow_midnight_carryover_floor,
+    _evening_to_midnight_reference_temp_f,
+    _project_midnight_carryover_floor_f,
+)
 from kalshi_weather.core.models import (
     TemperatureForecast,
     MarketBracket,
     BracketType,
     TradingSignal,
+    DailyObservation,
+    StationReading,
+    StationType,
 )
 
 @pytest.fixture
@@ -234,3 +242,222 @@ def test_source_change_state_resets_on_new_day(tmp_path):
     saved_payload = json.loads(state_file.read_text(encoding="utf-8"))
     assert saved_payload["day_anchor"] == today
     assert saved_payload["entries"] == []
+
+
+def test_project_midnight_carryover_floor_late_day_cooling():
+    tz = ZoneInfo("America/New_York")
+    observation = DailyObservation(
+        station_id="KNYC",
+        date="2026-07-10",
+        observed_high_f=84.0,
+        possible_actual_high_low=83.0,
+        possible_actual_high_high=85.0,
+        readings=[
+            StationReading(
+                station_id="KNYC",
+                timestamp=datetime(2026, 7, 10, 20, 0, tzinfo=tz),
+                station_type=StationType.HOURLY,
+                reported_temp_f=84.0,
+                reported_temp_c=None,
+                possible_actual_f_low=83.5,
+                possible_actual_f_high=84.5,
+            ),
+            StationReading(
+                station_id="KNYC",
+                timestamp=datetime(2026, 7, 10, 21, 0, tzinfo=tz),
+                station_type=StationType.HOURLY,
+                reported_temp_f=82.0,
+                reported_temp_c=None,
+                possible_actual_f_low=81.5,
+                possible_actual_f_high=82.5,
+            ),
+            StationReading(
+                station_id="KNYC",
+                timestamp=datetime(2026, 7, 10, 22, 0, tzinfo=tz),
+                station_type=StationType.HOURLY,
+                reported_temp_f=80.0,
+                reported_temp_c=None,
+                possible_actual_f_low=79.5,
+                possible_actual_f_high=80.5,
+            ),
+        ],
+        last_updated=datetime(2026, 7, 10, 22, 5, tzinfo=tz),
+    )
+    now_local = datetime(2026, 7, 10, 22, 5, tzinfo=tz)
+
+    carryover_floor = _project_midnight_carryover_floor_f(
+        observation=observation,
+        tomorrow_date="2026-07-11",
+        now_local=now_local,
+    )
+    assert carryover_floor == pytest.approx(76.0)
+
+    adjusted = _apply_tomorrow_midnight_carryover_floor(
+        tomorrow_mean_f=72.0,
+        tomorrow_date="2026-07-11",
+        now_local=now_local,
+        observation=observation,
+    )
+    assert adjusted == pytest.approx(76.0)
+
+
+def test_project_midnight_carryover_floor_not_applied_too_early():
+    tz = ZoneInfo("America/New_York")
+    observation = DailyObservation(
+        station_id="KNYC",
+        date="2026-07-10",
+        observed_high_f=84.0,
+        possible_actual_high_low=83.0,
+        possible_actual_high_high=85.0,
+        readings=[
+            StationReading(
+                station_id="KNYC",
+                timestamp=datetime(2026, 7, 10, 14, 0, tzinfo=tz),
+                station_type=StationType.HOURLY,
+                reported_temp_f=84.0,
+                reported_temp_c=None,
+                possible_actual_f_low=83.5,
+                possible_actual_f_high=84.5,
+            ),
+            StationReading(
+                station_id="KNYC",
+                timestamp=datetime(2026, 7, 10, 15, 0, tzinfo=tz),
+                station_type=StationType.HOURLY,
+                reported_temp_f=83.0,
+                reported_temp_c=None,
+                possible_actual_f_low=82.5,
+                possible_actual_f_high=83.5,
+            ),
+        ],
+        last_updated=datetime(2026, 7, 10, 15, 0, tzinfo=tz),
+    )
+    now_local = datetime(2026, 7, 10, 15, 5, tzinfo=tz)
+
+    carryover_floor = _project_midnight_carryover_floor_f(
+        observation=observation,
+        tomorrow_date="2026-07-11",
+        now_local=now_local,
+    )
+    assert carryover_floor is None
+
+    adjusted = _apply_tomorrow_midnight_carryover_floor(
+        tomorrow_mean_f=72.0,
+        tomorrow_date="2026-07-11",
+        now_local=now_local,
+        observation=observation,
+    )
+    assert adjusted == pytest.approx(72.0)
+
+
+def test_night_high_prediction_only_triggers_when_tomorrow_below_evening_context():
+    tz = ZoneInfo("America/New_York")
+    observation = DailyObservation(
+        station_id="KNYC",
+        date="2026-07-10",
+        observed_high_f=84.0,
+        possible_actual_high_low=83.0,
+        possible_actual_high_high=85.0,
+        readings=[
+            StationReading(
+                station_id="KNYC",
+                timestamp=datetime(2026, 7, 10, 20, 0, tzinfo=tz),
+                station_type=StationType.HOURLY,
+                reported_temp_f=84.0,
+                reported_temp_c=None,
+                possible_actual_f_low=83.5,
+                possible_actual_f_high=84.5,
+            ),
+            StationReading(
+                station_id="KNYC",
+                timestamp=datetime(2026, 7, 10, 21, 0, tzinfo=tz),
+                station_type=StationType.HOURLY,
+                reported_temp_f=82.0,
+                reported_temp_c=None,
+                possible_actual_f_low=81.5,
+                possible_actual_f_high=82.5,
+            ),
+            StationReading(
+                station_id="KNYC",
+                timestamp=datetime(2026, 7, 10, 22, 0, tzinfo=tz),
+                station_type=StationType.HOURLY,
+                reported_temp_f=80.0,
+                reported_temp_c=None,
+                possible_actual_f_low=79.5,
+                possible_actual_f_high=80.5,
+            ),
+        ],
+        last_updated=datetime(2026, 7, 10, 22, 5, tzinfo=tz),
+    )
+    now_local = datetime(2026, 7, 10, 22, 5, tzinfo=tz)
+
+    evening_reference = _evening_to_midnight_reference_temp_f(
+        observation=observation,
+        tomorrow_date="2026-07-11",
+        now_local=now_local,
+    )
+    assert evening_reference == pytest.approx(84.0)
+
+    unchanged = _apply_tomorrow_midnight_carryover_floor(
+        tomorrow_mean_f=85.0,
+        tomorrow_date="2026-07-11",
+        now_local=now_local,
+        observation=observation,
+    )
+    assert unchanged == pytest.approx(85.0)
+
+
+def test_night_high_prediction_not_applied_while_evening_still_warming():
+    tz = ZoneInfo("America/New_York")
+    observation = DailyObservation(
+        station_id="KNYC",
+        date="2026-07-10",
+        observed_high_f=74.0,
+        possible_actual_high_low=73.0,
+        possible_actual_high_high=75.0,
+        readings=[
+            StationReading(
+                station_id="KNYC",
+                timestamp=datetime(2026, 7, 10, 19, 0, tzinfo=tz),
+                station_type=StationType.HOURLY,
+                reported_temp_f=70.0,
+                reported_temp_c=None,
+                possible_actual_f_low=69.5,
+                possible_actual_f_high=70.5,
+            ),
+            StationReading(
+                station_id="KNYC",
+                timestamp=datetime(2026, 7, 10, 20, 0, tzinfo=tz),
+                station_type=StationType.HOURLY,
+                reported_temp_f=72.0,
+                reported_temp_c=None,
+                possible_actual_f_low=71.5,
+                possible_actual_f_high=72.5,
+            ),
+            StationReading(
+                station_id="KNYC",
+                timestamp=datetime(2026, 7, 10, 21, 0, tzinfo=tz),
+                station_type=StationType.HOURLY,
+                reported_temp_f=74.0,
+                reported_temp_c=None,
+                possible_actual_f_low=73.5,
+                possible_actual_f_high=74.5,
+            ),
+        ],
+        last_updated=datetime(2026, 7, 10, 21, 5, tzinfo=tz),
+    )
+    now_local = datetime(2026, 7, 10, 21, 5, tzinfo=tz)
+
+    carryover_floor = _project_midnight_carryover_floor_f(
+        observation=observation,
+        tomorrow_date="2026-07-11",
+        now_local=now_local,
+    )
+    assert carryover_floor is None
+
+    unchanged = _apply_tomorrow_midnight_carryover_floor(
+        tomorrow_mean_f=60.0,
+        tomorrow_date="2026-07-11",
+        now_local=now_local,
+        observation=observation,
+    )
+    assert unchanged == pytest.approx(60.0)
